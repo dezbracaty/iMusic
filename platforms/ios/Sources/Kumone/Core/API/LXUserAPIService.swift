@@ -189,6 +189,10 @@ final class LXUserAPIService: ObservableObject {
             throw DownloadAttemptFailure.missingQuality
         }
 
+        if requestKey == AudioQuality.master.lxType, platform != DownloadMasterRule.platform {
+            throw DownloadAttemptFailure.masterRuleUnavailable
+        }
+
         let selectedTrack: Track
         if platform == primary {
             selectedTrack = track
@@ -1403,7 +1407,7 @@ final class LXUserAPIService: ObservableObject {
         case "320", "320k": return "320k"
         case "flac", "lossless", "ape": return "flac"
         case "flac24", "flac24bit", "hires", "highres": return "flac24bit"
-        case "master", "jymaster", "master_quality", "master-quality": return "jymaster"
+        case "master", "jymaster", "master_quality", "master-quality", "viper_tape": return "jymaster"
         case "atmos", "immersive": return "atmos"
         case "dolby", "dolby-atmos", "dolbyatmos": return "dolby"
         case "surround", "spatial", "spatial-audio": return "surround"

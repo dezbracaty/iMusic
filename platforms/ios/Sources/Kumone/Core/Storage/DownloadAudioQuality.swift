@@ -6,6 +6,8 @@ enum DownloadQualityError: LocalizedError {
     case unsupportedVerification
     case mismatch(String)
     case unverifiable(String?)
+    case masterSpecificationsMismatch(String)
+    case masterSpecificationsUnverifiable(String?)
 
     var errorDescription: String? {
         switch self {
@@ -13,14 +15,38 @@ enum DownloadQualityError: LocalizedError {
         case .mismatch(let received): return "文件音质与所选音质不符（收到 \(received)）"
         case .unverifiable(let received):
             return received.map { "无法核验返回文件的所选音质（识别为 \($0)）" } ?? "无法核验返回文件的编码或音质"
+        case .masterSpecificationsMismatch(let received):
+            return "酷狗母带下载需 192 kHz、24-bit 或以上无损（收到 \(received)），可换档下载"
+        case .masterSpecificationsUnverifiable(let received):
+            let detail = received.map { "（识别为 \($0)）" } ?? ""
+            return "无法核验母带请求返回文件的无损位深和采样率\(detail)，可换档下载"
         }
     }
+}
+
+enum DownloadMasterRule {
+    static let platform = "kg"
+    static let requestKeys = ["master", "jymaster", "viper_tape"]
+    // Kugou's VIPER certification lists 192 kHz for Master and 96 kHz for
+    // Hi-Res: https://ksyx.kugou.com/authorise.html
+    // Require high-bit-depth lossless for this download option. These checks
+    // establish file specifications only, not the recording's provenance.
+    static let sampleRate = 192_000
+    static let minimumBitDepth = 24
 }
 
 struct DownloadAudioQuality: Codable, Hashable {
     let codec: String
     let bitRate: Int?
     let bitDepth: Int?
+    let sampleRate: Int?
+
+    init(codec: String, bitRate: Int?, bitDepth: Int?, sampleRate: Int? = nil) {
+        self.codec = codec
+        self.bitRate = bitRate
+        self.bitDepth = bitDepth
+        self.sampleRate = sampleRate
+    }
 
     var label: String {
         if let bitDepth { return "\(codec) \(bitDepth)-bit" }
@@ -28,8 +54,14 @@ struct DownloadAudioQuality: Codable, Hashable {
         return codec
     }
 
+    var specificationLabel: String {
+        guard let sampleRate else { return label }
+        let kilohertz = (Double(sampleRate) / 1_000).formatted(.number.precision(.fractionLength(0...3)))
+        return "\(label) · \(kilohertz) kHz"
+    }
+
     // The file reader may report an average rather than the encoder's nominal rate.
-    func matches(_ quality: AudioQuality) -> Bool {
+    func matchesFileSpecifications(for quality: AudioQuality) -> Bool {
         switch quality {
         case .standard:
             return isLossy && bitRate.map { (125_440...160_000).contains($0) } == true
@@ -39,7 +71,10 @@ struct DownloadAudioQuality: Codable, Hashable {
             return isLossless && bitDepth.map { $0 >= 16 } == true
         case .hires:
             return isLossless && bitDepth.map { $0 >= 24 } == true
-        case .master, .atmos, .dolby, .surround:
+        case .master:
+            return isLossless && sampleRate == DownloadMasterRule.sampleRate
+                && bitDepth.map { $0 >= DownloadMasterRule.minimumBitDepth } == true
+        case .atmos, .dolby, .surround:
             return false
         }
     }
@@ -50,7 +85,9 @@ struct DownloadAudioQuality: Codable, Hashable {
             return isLossy ? bitRate != nil : isLossless
         case .lossless, .hires:
             return isLossless ? bitDepth != nil : isLossy
-        case .master, .atmos, .dolby, .surround:
+        case .master:
+            return isLossy || codec == "PCM Float" || (isLossless && bitDepth != nil && sampleRate != nil)
+        case .atmos, .dolby, .surround:
             return false
         }
     }
@@ -90,19 +127,24 @@ struct DownloadAudioQuality: Codable, Hashable {
             default: break
             }
         }
-        return Self(codec: codec, bitRate: hasRate ? Int(rate) : nil, bitDepth: depth > 0 ? Int(depth) : nil)
+        let sampleRate = format.mSampleRate
+        let measuredSampleRate = sampleRate > 0 && sampleRate < Double(Int32.max)
+            ? Int(exactly: sampleRate) : nil
+        return Self(codec: codec, bitRate: hasRate ? Int(rate) : nil, bitDepth: depth > 0 ? Int(depth) : nil,
+                    sampleRate: measuredSampleRate)
     }
 }
 
 extension AudioQuality {
-    static let verifiableDownloads: [Self] = [.hires, .lossless, .exhigh, .standard]
+    static let downloadOptions: [Self] = [.master, .hires, .lossless, .exhigh, .standard]
 
-    var canVerifyDownload: Bool {
-        Self.verifiableDownloads.contains { $0.lxType == lxType }
+    var canAttemptDownload: Bool {
+        Self.downloadOptions.contains { $0.lxType == lxType }
     }
 
     var downloadLabel: String {
         switch self {
+        case .master: return "母带 / Master（酷狗规格核验）"
         case .lossless: return "无损 16-bit 或以上"
         case .hires: return "Hi-Res 无损 24-bit 或以上"
         default: return sourceDisplayName

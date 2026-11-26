@@ -27,6 +27,7 @@ enum DownloadAttemptFailure: LocalizedError {
     case noInterface
     case sourceUnavailable
     case missingQuality
+    case masterRuleUnavailable
     case noAddress
     case resolutionTimeout
     case noSources
@@ -39,6 +40,7 @@ enum DownloadAttemptFailure: LocalizedError {
         case .noInterface: return "音源未提供可用平台的播放接口"
         case .sourceUnavailable: return "LX 音源未能初始化"
         case .missingQuality: return "音源未提供所选音质"
+        case .masterRuleUnavailable: return "此平台缺少可核验的母带下载规格，可换档下载"
         case .noAddress: return "音源未返回所选音质的有效地址"
         case .resolutionTimeout: return "LX 音源解析超时"
         case .noSources: return "请先导入并启用 LX 音源"

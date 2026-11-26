@@ -29,7 +29,7 @@ class UnsignedAssetNameTests(unittest.TestCase):
 
     def test_development_and_tagged_versions_resolve_separately(self):
         fixtures = [
-            ('refs/heads/dev', 'dev', '1', '2.1.0', '2.1-dev', '215'),
+            ('refs/heads/dev', 'dev', '1', '2.1.0', '2.1-dev', '216'),
             ('refs/tags/v2.1', 'v2.1', '255', '2.1.0', '2.1', '255'),
             ('refs/tags/v2.1.3-rc1', 'v2.1.3-rc1', '256', '2.1.3', '2.1.3-rc1', '256'),
         ]

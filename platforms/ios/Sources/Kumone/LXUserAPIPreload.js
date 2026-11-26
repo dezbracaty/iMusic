@@ -154,7 +154,7 @@ globalThis.lx_setup = (key, id, name, description, version, author, homepage, ra
   const extendedQualitys = ['128k', '320k', 'flac', 'flac24bit', 'master', 'jymaster', 'dolby', 'atmos', 'surround']
   const supportQualitys = {
     kw: extendedQualitys,
-    kg: extendedQualitys,
+    kg: [...extendedQualitys, 'viper_tape'],
     tx: extendedQualitys,
     wy: extendedQualitys,
   }

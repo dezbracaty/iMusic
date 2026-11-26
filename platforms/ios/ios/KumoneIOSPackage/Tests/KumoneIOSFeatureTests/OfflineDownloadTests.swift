@@ -301,6 +301,108 @@ struct OfflineDownloadTests {
         #expect(downloads.failures[key] == nil)
     }
 
+    @Test("Only the declared Kugou Master key is sent, and passing audio is labeled as measured specifications",
+          arguments: ["master", "jymaster", "viper_tape"])
+    func verifiesKugouMasterSpecifications(token: String) async throws {
+        let aac = try Self.fixture("tone-192", "m4a")
+        let lossless = try Self.fixture("tone-16", "flac")
+        let hiRes = try Self.fixture("tone-24", "flac")
+        // Synthetic 2 s tone, encoded independently as 24-bit FLAC at 192 kHz.
+        let master = try Self.fixture("tone-master-192k", "flac")
+        let server = try await LocalAudioServer([
+            "/denied": [Reply(headers: ["X-Download-Allowed: false"], contentType: "audio/flac", audio: master)],
+            "/lossy": [Reply(headers: ["X-Quality: master"], contentType: "audio/mp4", audio: aac)],
+            "/ordinary": [Reply(contentType: "audio/flac", audio: lossless)],
+            "/hires": [Reply(contentType: "audio/flac", audio: hiRes)],
+            "/passing": [Reply(contentType: "audio/flac", audio: master)],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sources = ["/denied", "/lossy", "/ordinary", "/hires", "/passing"].enumerated().map { index, path in
+            Self.source(id: "master-candidate-\(index)", qualities: "'\(token)', 'flac24bit', 'flac'", platform: "kg") {
+                "if (info.type === '\(token)') return '\(server.url(path).absoluteString)'; throw Error('wrong tier');"
+            }
+        }
+        let resolver = LXUserAPIService(sourceSnapshot: { (0, sources) })
+        let report = TransferReports()
+        func manager() -> DownloadManager {
+            DownloadManager(directory: directory, findDownload: resolver.findDownload,
+                            selectedSourceID: { sources[0].id }, reportTransfer: { report.append($0) })
+        }
+        let downloads = manager()
+        let track = Self.track(source: "kg")
+        await (try #require(downloads.download(track, quality: .master))).value
+        let record = try #require(downloads.record(for: track))
+        #expect(record.quality == "jymaster")
+        #expect(record.qualityVerified == false)
+        #expect(record.requestToken == token)
+        #expect(record.sourceID == "master-candidate-4")
+        #expect(record.audio?.bitDepth == 24)
+        #expect(record.audio?.sampleRate == 192_000)
+        #expect(record.qualityLabel == "音源标称母带（身份未核验） · 实际 FLAC 24-bit · 192 kHz")
+        #expect(try Data(contentsOf: downloads.fileURL(for: record)) == master)
+        #expect(downloads.failures.isEmpty)
+        #expect(server.requestedPaths == ["/denied", "/lossy", "/ordinary", "/hires", "/passing"])
+        #expect(report.values.map(\.mainBytes) == [0, 4_096, 42, 42, master.count])
+        #expect(report.values.allSatisfy { $0.rangeRequests == 0 })
+
+        let reopened = manager()
+        #expect(reopened.record(for: track)?.qualityLabel == record.qualityLabel)
+        #expect(reopened.alreadyDownloaded(track, quality: .master))
+        #expect(!reopened.alreadyDownloaded(track, quality: .hires))
+        #expect(reopened.download(track, quality: .master) == nil)
+        #expect(try Self.stagedFiles(in: directory).isEmpty)
+        print("Master metrics (\(token)): 5 GETs with application reads \(report.values.map(\.mainBytes))")
+    }
+
+    @Test("A claimed Master label on another platform gives a change-tier action without fetching the file",
+          arguments: ["tx", "wy", "kw"])
+    func requiresProviderEvidence(platform: String) async throws {
+        let flac = try Self.fixture("tone-24", "flac")
+        let server = try await LocalAudioServer([
+            "/unknown": [Reply(contentType: "audio/flac", audio: flac)],
+            "/hires": [Reply(contentType: "audio/flac", audio: flac)],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = Self.source(id: "unsupported-master", qualities: "'jymaster', 'flac24bit'", platform: platform) {
+            """
+            if (info.type === 'jymaster') return '\(server.url("/unknown").absoluteString)';
+            if (info.type === 'flac24bit') return '\(server.url("/hires").absoluteString)';
+            throw Error('unexpected tier');
+            """
+        }
+        let resolver = LXUserAPIService(sourceSnapshot: { (0, [source]) })
+        let downloads = DownloadManager(directory: directory, findDownload: resolver.findDownload)
+        let track = Self.track(source: platform)
+        await (try #require(downloads.download(track, quality: .master))).value
+        let failure = try #require(downloads.failures[DownloadManager.key(for: track)])
+        #expect(failure.requestedQuality == .master)
+        #expect(failure.message.contains("缺少可核验的母带下载规格"))
+        #expect(server.requestedPaths.isEmpty)
+        #expect(downloads.records.isEmpty)
+        #expect(downloads.alternativeQualities(for: failure).contains(.hires))
+        #expect(!downloads.alternativeQualities(for: failure).contains(.master))
+        await (try #require(downloads.retry(failure, quality: .hires))).value
+        let record = try #require(downloads.record(for: track))
+        #expect(record.qualityVerified == true)
+        #expect(record.qualityLabel == "实际 FLAC 24-bit")
+        #expect(server.requestedPaths == ["/hires"])
+    }
+
+    @Test("A legacy file quality without a sample rate reopens without inferring a Master specification")
+    func readsLegacyQualityWithoutSampleRate() throws {
+        let legacy = try JSONDecoder().decode(DownloadAudioQuality.self, from: Data("""
+            {"codec":"FLAC","bitRate":185147,"bitDepth":24}
+            """.utf8))
+        #expect(legacy.sampleRate == nil)
+        #expect(legacy.matchesFileSpecifications(for: .hires))
+        #expect(!legacy.canCompare(to: .master))
+        #expect(!legacy.matchesFileSpecifications(for: .master))
+    }
+
     @Test("Hi-Res uses flac only after native routes fail, and saves verified 24-bit audio",
           arguments: [false, true])
     func resolvesHiResThroughVerifiedLosslessKey(nativeBackupSucceeds: Bool) async throws {
@@ -434,8 +536,8 @@ struct OfflineDownloadTests {
     }
 
     @Test("MP4 trailing metadata reads only a validated bounded range",
-          arguments: RangeMode.allCases)
-    func verifiesTrailingMetadata(mode: RangeMode) async throws {
+          arguments: RangeMode.allCases, [AudioQuality.hires, .master])
+    func verifiesTrailingMetadata(mode: RangeMode, quality: AudioQuality) async throws {
         let original = try Self.fixture("tone-192", "m4a")
         let (movie, moovOffset) = try Self.movieWithTrailingMetadata(original)
         let moov = Data(movie.suffix(from: moovOffset))
@@ -460,7 +562,7 @@ struct OfflineDownloadTests {
             suffix = Reply(status: 206, length: moov.count, headers: [etag, range], contentType: "audio/mp4",
                            audio: Data(moov.dropLast(1)))
         }
-        let flac = try Self.fixture("tone-24", "flac")
+        let flac = try Self.fixture(quality == .master ? "tone-master-192k" : "tone-24", "flac")
         let server = try await LocalAudioServer([
             "/movie": [full, suffix],
             "/unknown-second": [Reply(contentType: "audio/mp4", audio: movie)],
@@ -474,7 +576,7 @@ struct OfflineDownloadTests {
         defer { session.invalidateAndCancel() }
         let allowance = DownloadUnverifiedAllowance()
         func fetch(_ path: String) async throws -> URL {
-            try await DownloadStream.fetch(server.url(path), quality: .hires, session: session, stagingDirectory: directory,
+            try await DownloadStream.fetch(server.url(path), quality: quality, session: session, stagingDirectory: directory,
                                            allowance: allowance, progress: { _ in },
                                            report: { report.append($0) })
         }
@@ -709,14 +811,14 @@ struct OfflineDownloadTests {
         ]
         for (name, ext, exact) in formats {
             let audio = try #require(DownloadAudioQuality.inspect(Self.fixtureURL(name, ext)))
-            #expect(audio.matches(exact))
+            #expect(audio.matchesFileSpecifications(for: exact))
         }
         let flac16 = try #require(DownloadAudioQuality.inspect(Self.fixtureURL("tone-16", "flac")))
         let flac24 = try #require(DownloadAudioQuality.inspect(Self.fixtureURL("tone-24", "flac")))
-        #expect(!flac16.matches(.hires))
-        #expect(flac24.matches(.lossless))
-        #expect(!DownloadAudioQuality(codec: "AAC", bitRate: 199_000, bitDepth: nil).matches(.exhigh))
-        #expect(DownloadAudioQuality(codec: "MP3", bitRate: 149_000, bitDepth: nil).matches(.standard))
+        #expect(!flac16.matchesFileSpecifications(for: .hires))
+        #expect(flac24.matchesFileSpecifications(for: .lossless))
+        #expect(!DownloadAudioQuality(codec: "AAC", bitRate: 199_000, bitDepth: nil).matchesFileSpecifications(for: .exhigh))
+        #expect(DownloadAudioQuality(codec: "MP3", bitRate: 149_000, bitDepth: nil).matchesFileSpecifications(for: .standard))
         #expect(!DownloadAudioQuality(codec: "FLAC", bitRate: nil, bitDepth: nil).canCompare(to: .hires))
     }
 

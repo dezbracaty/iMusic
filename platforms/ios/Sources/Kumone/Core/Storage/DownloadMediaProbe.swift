@@ -27,8 +27,10 @@ struct DownloadMediaProbe {
             }
             let packed = data.u32(at: start + 18)
             let depth = (packed >> 4 & 31) + 1
-            guard packed >> 12 > 0, depth >= 4 else { return .init(fileExtension: "flac") }
-            return .init(fileExtension: "flac", audio: .init(codec: "FLAC", bitRate: nil, bitDepth: depth))
+            let sampleRate = packed >> 12
+            guard sampleRate > 0, depth >= 4 else { return .init(fileExtension: "flac") }
+            return .init(fileExtension: "flac", audio: .init(codec: "FLAC", bitRate: nil, bitDepth: depth,
+                                                            sampleRate: sampleRate))
         }
         if ["ftyp", "moov", "mdat", "free", "wide", "skip"].contains(data.fourCC(at: start + 4)), start == 0 {
             return inspectMovie(data, base: 0)
@@ -105,7 +107,8 @@ struct DownloadMediaProbe {
                   config.payload + 28 <= config.end else { return nil }
             let depth = Int(data[config.payload + 9])
             guard [16, 20, 24, 32].contains(depth) else { return nil }
-            return .init(codec: "ALAC", bitRate: nil, bitDepth: depth)
+            let sampleRate = data.u32(at: config.payload + 24)
+            return .init(codec: "ALAC", bitRate: nil, bitDepth: depth, sampleRate: sampleRate > 0 ? sampleRate : nil)
         case "mp4a":
             guard let esds = children.first(where: { $0.type == "esds" }) else { return nil }
             return aacDescription(data, in: esds)

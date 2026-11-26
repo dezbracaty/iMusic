@@ -137,7 +137,8 @@ enum DownloadStream {
 
     private static func canContinue(_ audio: DownloadAudioQuality?, quality: AudioQuality) throws -> Bool {
         guard let audio, audio.canCompare(to: quality) else { return false }
-        if audio.matches(quality) { return true }
+        if audio.matchesFileSpecifications(for: quality) { return true }
+        if quality == .master { throw DownloadQualityError.masterSpecificationsMismatch(audio.specificationLabel) }
         // An AAC descriptor's bitrate may be nominal rather than the rate
         // reported by the complete audio file. Reject definite format/depth
         // mismatches here and leave ambiguous lossy rates for final validation.

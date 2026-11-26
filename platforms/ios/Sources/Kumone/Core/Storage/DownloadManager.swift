@@ -28,6 +28,9 @@ final class DownloadManager {
         }
 
         var qualityLabel: String {
+            if quality == AudioQuality.master.lxType, let audio {
+                return "音源标称母带（身份未核验） · 实际 \(audio.specificationLabel)"
+            }
             if let audio { return "实际 \(audio.label)" }
             let tier = AudioQuality(lxType: quality)?.downloadLabel ?? quality
             return qualityVerified == true ? "已确认 \(tier)" : "旧版请求 \(tier) · 实际音质未知"
@@ -120,9 +123,14 @@ final class DownloadManager {
     }
 
     func alreadyDownloaded(_ track: Track, quality: AudioQuality) -> Bool {
-        guard let record = record(for: track) else { return false }
-        return (record.preferredSourceID ?? record.sourceID) == selectedSourceID()
-            && record.quality == quality.lxType && record.qualityVerified == true
+        guard let record = record(for: track), record.quality == quality.lxType,
+              (record.preferredSourceID ?? record.sourceID) == selectedSourceID() else { return false }
+        if quality == .master {
+            return record.sourcePlatform == DownloadMasterRule.platform
+                && record.requestToken.map(DownloadMasterRule.requestKeys.contains) == true
+                && record.audio?.matchesFileSpecifications(for: .master) == true
+        }
+        return record.qualityVerified == true
     }
 
     @discardableResult
@@ -132,7 +140,7 @@ final class DownloadManager {
     }
 
     func alternativeQualities(for failure: Failure) -> [AudioQuality] {
-        AudioQuality.verifiableDownloads.filter {
+        AudioQuality.downloadOptions.filter {
             $0.lxType != failure.requestedQuality.lxType && !alreadyDownloaded(failure.track, quality: $0)
         }
     }
@@ -159,7 +167,7 @@ final class DownloadManager {
 
         let requestedQuality = quality ?? SettingsManager.shared.audioQuality
         guard !alreadyDownloaded(track, quality: requestedQuality) else { return nil }
-        guard requestedQuality.canVerifyDownload else {
+        guard requestedQuality.canAttemptDownload else {
             reportFailure(for: track, quality: requestedQuality,
                           message: DownloadQualityError.unsupportedVerification.localizedDescription)
             return nil
@@ -189,7 +197,7 @@ final class DownloadManager {
                 try checkRevision(revision)
                 let fileName = "offline-\(UUID().uuidString).\(staged.pathExtension)"
                 var item = Record(id: key, track: track, quality: requestedQuality.lxType,
-                                  qualityVerified: true, fileName: fileName, createdAt: Date())
+                                  qualityVerified: requestedQuality != .master, fileName: fileName, createdAt: Date())
                 item.preferredSourceID = sourceID
                 item.sourceID = verified.candidate.sourceID
                 item.sourceName = verified.candidate.sourceName
@@ -230,6 +238,12 @@ final class DownloadManager {
     private func verify(_ candidate: DownloadCandidate, for track: Track, quality: AudioQuality,
                         key: String, allowance: DownloadUnverifiedAllowance) async throws -> VerifiedDownload {
         let platform = SearchRecordingGroups.source(of: candidate.track)
+        if quality == .master {
+            guard platform == DownloadMasterRule.platform,
+                  candidate.requestToken.map(DownloadMasterRule.requestKeys.contains) == true else {
+                throw DownloadAttemptFailure.masterRuleUnavailable
+            }
+        }
         if var active = activeDownloads[key] {
             active.fraction = nil
             active.candidateLabel = candidate.sourceName.map {
@@ -248,9 +262,15 @@ final class DownloadManager {
             try Task.checkCancellation()
             let audio = DownloadAudioQuality.inspect(file)
             guard let audio, audio.canCompare(to: quality) else {
+                if quality == .master {
+                    throw DownloadQualityError.masterSpecificationsUnverifiable(audio?.specificationLabel)
+                }
                 throw DownloadQualityError.unverifiable(audio?.label)
             }
-            guard audio.matches(quality) else { throw DownloadQualityError.mismatch(audio.label) }
+            guard audio.matchesFileSpecifications(for: quality) else {
+                if quality == .master { throw DownloadQualityError.masterSpecificationsMismatch(audio.specificationLabel) }
+                throw DownloadQualityError.mismatch(audio.label)
+            }
             return VerifiedDownload(candidate: candidate, file: file, audio: audio)
         } catch {
             if let staged { try? FileManager.default.removeItem(at: staged) }

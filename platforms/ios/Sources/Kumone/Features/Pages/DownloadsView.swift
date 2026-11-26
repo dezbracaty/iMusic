@@ -78,7 +78,7 @@ struct DownloadsView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             HStack(spacing: 16) {
-                                if item.requestedQuality.canVerifyDownload {
+                                if item.requestedQuality.canAttemptDownload {
                                     Button("重试原档位") { downloads.retry(item) }
                                         .accessibilityIdentifier("retryOriginalDownloadQuality")
                                 }
@@ -172,12 +172,12 @@ struct TrackDownloadMenu: View {
     private func qualityOptions(for candidate: Track) -> some View {
         Text("优先 \(platformName(for: candidate)) · \(sources.selectedSource?.name ?? "未选择 LX 音源")")
         let preferred = settings.audioQuality
-        if !preferred.canVerifyDownload {
+        if !preferred.canAttemptDownload {
             Button("所选音质：\(preferred.downloadLabel)") {
                 downloads.download(candidate, quality: preferred)
             }
         }
-        ForEach(AudioQuality.verifiableDownloads) { quality in
+        ForEach(AudioQuality.downloadOptions) { quality in
             let installed = downloads.alreadyDownloaded(candidate, quality: quality)
             Button {
                 downloads.download(candidate, quality: quality)
