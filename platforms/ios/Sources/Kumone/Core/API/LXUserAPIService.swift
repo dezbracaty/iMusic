@@ -58,6 +58,7 @@ final class LXUserAPIService: ObservableObject {
     /// user's persisted sources. Production always reads the live store.
     private let sourceSnapshot: () -> (revision: Int, sources: [LXSourceStore.Source])
     private let catalogueMatch: @MainActor (Track, String) async -> Track?
+    private let downloadMatch: @MainActor (Track, String) async -> Track?
     private let platformFallbackEnabled: @MainActor () -> Bool
     private var context: JSContext?
     private var key = ""
@@ -81,12 +82,16 @@ final class LXUserAPIService: ObservableObject {
     init(session: URLSession? = nil,
          sourceSnapshot: (() -> (revision: Int, sources: [LXSourceStore.Source]))? = nil,
          catalogueMatch: (@MainActor (Track, String) async -> Track?)? = nil,
+         downloadMatch: (@MainActor (Track, String) async -> Track?)? = nil,
          platformFallbackEnabled: (@MainActor () -> Bool)? = nil) {
         self.sourceSnapshot = sourceSnapshot ?? {
             (LXSourceStore.shared.configurationRevision, LXSourceStore.shared.playbackSources)
         }
         self.catalogueMatch = catalogueMatch ?? { track, platform in
             await LXCatalogService.matchingTrack(track, on: platform)
+        }
+        self.downloadMatch = downloadMatch ?? { track, platform in
+            await LXCatalogService.matchingDownloadTrack(track, on: platform)
         }
         self.platformFallbackEnabled = platformFallbackEnabled ?? {
             SettingsManager.shared.enableSourcePlatformFallback
@@ -115,48 +120,118 @@ final class LXUserAPIService: ObservableObject {
             .forEach { $0.invalidateSourceWork() }
     }
 
-    func resolveDownloadMusicURL(for track: Track, quality: String) async throws -> ResolvedURL {
+    func findDownload(for track: Track, quality: AudioQuality,
+                      verify: @MainActor (DownloadCandidate) async throws -> VerifiedDownload) async throws -> VerifiedDownload {
         let resolver = self === Self.shared ? Self.downloadResolver : self
-        return try await resolver.resolveExactDownload(for: track, quality: quality)
+        return try await resolver.findVerifiedDownload(for: track, quality: quality, verify: verify)
     }
 
-    private func resolveExactDownload(for track: Track, quality: String) async throws -> ResolvedURL {
+    private func findVerifiedDownload(
+        for track: Track, quality: AudioQuality,
+        verify: @MainActor (DownloadCandidate) async throws -> VerifiedDownload
+    ) async throws -> VerifiedDownload {
+        let snapshot = sourceSnapshot()
+        guard !snapshot.sources.isEmpty else { throw DownloadAttemptFailure.noSources }
+        let primary = primaryPlatform(for: track)
+        let fallbackPlatforms = ["wy", "kw", "kg", "tx"].filter { Optional($0) != primary }
+        var matches: [String: Track?] = [:]
+        var failures: [DownloadAttemptFailure] = []
+        var attemptedURLs = Set<URL>()
+
+        // Try the requested catalogue with every enabled script first, in
+        // selection order. Only then look up the same recording elsewhere.
+        for platforms in [primary.map { [$0] } ?? [], fallbackPlatforms] where !platforms.isEmpty {
+            sourceLoop: for source in snapshot.sources {
+                for platform in platforms {
+                    try Task.checkCancellation()
+                    try validateSourceConfiguration(snapshot.revision, source: source)
+                    do {
+                        let candidate = try await downloadCandidate(
+                            for: track, on: platform, primary: primary, quality: quality,
+                            source: source, revision: snapshot.revision, matches: &matches
+                        )
+                        guard attemptedURLs.insert(candidate.url).inserted else { continue }
+                        // Audio transfers do not hold the JavaScript context lock.
+                        return try await verify(candidate)
+                    } catch let failure as DownloadAttemptFailure {
+                        failures.append(failure)
+                        if case .sourceUnavailable = failure { continue sourceLoop }
+                    }
+                }
+            }
+        }
+
+        try Task.checkCancellation()
+        try validateSourceConfiguration(snapshot.revision)
+        throw ExhaustedDownloadCandidates(failures: failures)
+    }
+
+    private func downloadCandidate(
+        for track: Track, on platform: String, primary: String?, quality: AudioQuality,
+        source: LXSourceStore.Source, revision: Int, matches: inout [String: Track?]
+    ) async throws -> DownloadCandidate {
         try await acquireSourceOperation()
         defer { releaseSourceOperation() }
+        try validateSourceConfiguration(revision, source: source)
+        let ready = await activate(source)
         try Task.checkCancellation()
-        guard let platform = primaryPlatform(for: track) else { throw LXCatalogError.unsupported }
-        let snapshot = sourceSnapshot()
-        // The selected LX script is first in the live snapshot. Backups are
-        // for streaming and must not fulfill an explicit offline request.
-        guard let source = snapshot.sources.first else { throw LXError.noSource }
-        guard await activate(source) else {
+        try validateSourceConfiguration(revision, source: source)
+        guard ready else { throw DownloadAttemptFailure.sourceUnavailable }
+        guard supports(platform, action: "musicUrl") else { throw DownloadAttemptFailure.noInterface }
+        let requested = quality.lxType
+        let declared = Set(qualityCapabilities[platform, default: []].map(Self.normalizedQuality))
+        // Catalogue sizes can be missing or incomplete. The script's tier
+        // declaration controls the request and the file controls acceptance.
+        guard declared.contains(requested) || (declared.isEmpty && requested == "128k") else {
+            throw DownloadAttemptFailure.missingQuality
+        }
+
+        let selectedTrack: Track
+        if platform == primary {
+            selectedTrack = track
+        } else {
+            if matches[platform] == nil {
+                let match = await downloadMatch(track, platform)
+                try Task.checkCancellation()
+                try validateSourceConfiguration(revision, source: source)
+                matches[platform] = .some(match)
+            }
+            guard let match = matches[platform] ?? nil,
+                  primaryPlatform(for: match) == platform,
+                  SearchRecordingGroups.sameDownloadRecording(track, match) else {
+                throw DownloadAttemptFailure.noRecording
+            }
+            selectedTrack = match
+        }
+        guard DownloadManager.permitsDownload(of: selectedTrack) else {
+            throw DownloadAttemptFailure.restrictedRecording
+        }
+        let qualities = Self.qualityOrder.filter { $0 == requested || declared.contains($0) }
+        let response: [String: Any]
+        do {
+            response = try await request(
+                source: platform, action: "musicUrl",
+                info: [
+                    "type": protocolQualityToken(requested, platform: platform),
+                    "musicInfo": musicInfo(for: selectedTrack, platform: platform, qualities: qualities),
+                ]
+            )
+        } catch {
             try Task.checkCancellation()
-            try validateSourceConfiguration(snapshot.revision, source: source)
-            throw LXError.sourceUnavailable(statusMessage)
+            try validateSourceConfiguration(revision, source: source)
+            if error is CancellationError { throw error }
+            if let error = error as? LXError, case .requestTimedOut = error {
+                throw DownloadAttemptFailure.resolutionTimeout
+            }
+            throw DownloadAttemptFailure.noAddress
         }
         try Task.checkCancellation()
-        try validateSourceConfiguration(snapshot.revision, source: source)
-        guard supports(platform, action: "musicUrl") else {
-            throw LXError.missingCapability(platform, "musicUrl")
-        }
-        let supported = supportedQualityNames(for: track, platform: platform)
-        guard let requested = AudioQuality(rawValue: quality)?.lxType, supported.contains(requested) else {
-            throw DownloadQualityError.unavailable
-        }
-        let response = try await request(
-            source: platform, action: "musicUrl",
-            info: [
-                "type": protocolQualityToken(requested, platform: platform),
-                "musicInfo": musicInfo(for: track, platform: platform, qualities: supported),
-            ]
-        )
-        try Task.checkCancellation()
-        try validateSourceConfiguration(snapshot.revision, source: source)
+        try validateSourceConfiguration(revision, source: source)
         guard let data = response["data"] as? [String: Any],
               let rawURL = data["url"] as? String, let url = URL(string: rawURL), Self.validHTTPURL(url) else {
-            throw DownloadQualityError.unavailable
+            throw DownloadAttemptFailure.noAddress
         }
-        return ResolvedURL(url: url, quality: requested, qualityIsVerified: false)
+        return DownloadCandidate(url: url, track: selectedTrack, sourceID: source.id, sourceName: source.name)
     }
 
     /// Load a provider only when a request actually needs one.  A user's

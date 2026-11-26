@@ -18,13 +18,14 @@ struct OfflineDownloadTests {
 
         let track = Self.track()
         let resolver = Self.resolver(url: server.url("/song"))
-        let downloads = DownloadManager(directory: directory, resolve: resolver.resolveDownloadMusicURL)
+        let downloads = DownloadManager(directory: directory, findDownload: resolver.findDownload,
+                                        selectedSourceID: { "offline-audio-fixture" })
         let key = DownloadManager.key(for: track)
         let first = try #require(downloads.download(track, quality: .standard))
         #expect(downloads.activeDownloads[key] != nil)
         #expect(downloads.download(track, quality: .standard) == nil)
         await first.value
-        #expect(downloads.failures[key]?.message == "服务器返回 HTTP 503")
+        #expect(downloads.failures[key]?.message.contains("服务器返回 HTTP 503") == true)
         #expect(downloads.activeDownloads.isEmpty)
         #expect(downloads.records.isEmpty)
         #expect(try Self.stagedFiles(in: directory).isEmpty)
@@ -197,68 +198,127 @@ struct OfflineDownloadTests {
         }
     }
 
-    @Test("Downloads use the original catalogue even when streaming allows cross-provider fallback")
-    func noCrossProviderFallback() async throws {
-        let url = URL(string: "https://example.invalid/music.wav")!
-        var catalogueMatches = 0
-        let match = Self.track()
-        let resolver = Self.resolver(url: url) { _, _ in
-            catalogueMatches += 1
-            return match
+    @Test("A selected stream-only URL and a lower-quality backup are skipped before an exact download")
+    func fallsBackAfterFetchAndValidationFailures() async throws {
+        let lower = try Self.fixture("tone-128", "m4a")
+        let verified = try Self.fixture("tone-320", "m4a")
+        let server = try await LocalAudioServer([
+            "/inline": [Reply(attachment: false, contentType: "audio/mp4", audio: verified)],
+            "/lower": [Reply(contentType: "audio/mp4", audio: lower)],
+            "/exact": [Reply(contentType: "audio/mp4", audio: verified)],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sources = [("preferred", "/inline"), ("low", "/lower"), ("backup", "/exact")].map { id, path in
+            Self.source(id: id, qualities: "'128k', '320k'") {
+                "if (info.type === '320k') return '\(server.url(path).absoluteString)'; throw Error('unexpected tier');"
+            }
         }
-        let original = Self.track(source: "wy")
-        do {
-            _ = try await resolver.resolveDownloadMusicURL(for: original, quality: AudioQuality.standard.rawValue)
-            Issue.record("A different catalogue must not supply an offline copy")
-        } catch let error as LXUserAPIService.LXError {
-            guard case .missingCapability = error else { throw error }
-        }
-        #expect(catalogueMatches == 0)
-        let streaming = try await resolver.resolveMusicURL(for: original, quality: AudioQuality.standard.rawValue)
-        #expect(streaming.url == url)
-        #expect(catalogueMatches == 1)
+        var track = Self.track()
+        track.sourceMetadata["lx.quality.128k.size"] = "1 MB"
+        let resolver = LXUserAPIService(sourceSnapshot: { (0, sources) }, platformFallbackEnabled: { false })
+        let downloads = DownloadManager(directory: directory, findDownload: resolver.findDownload,
+                                        selectedSourceID: { "preferred" })
+        await (try #require(downloads.download(track, quality: .exhigh))).value
+        let record = try #require(downloads.record(for: track))
+        #expect(record.sourceID == "backup")
+        #expect(record.sourceLabel == "QQ 音乐 · backup")
+        #expect(record.quality == "320k")
+        #expect(try Data(contentsOf: downloads.fileURL(for: record)) == verified)
+        #expect(downloads.alreadyDownloaded(track, quality: .exhigh))
+        #expect(downloads.failures.isEmpty)
+        #expect(try Self.stagedFiles(in: directory).isEmpty)
     }
 
-    @Test("Downloads preserve the selected LX script and exact quality token")
-    func usesExactScriptAndQuality() async throws {
-        let backupURL = URL(string: "https://backup.example.invalid/tone.flac")!
-        let preferred = Self.source(id: "selected", qualities: "'128k', 'flac24bit'") { """
-            if (info.type === 'flac24bit') return 'https://selected.example.invalid/hires.flac';
-            throw new Error('Unavailable');
-            """ }
-        let backup = Self.source(id: "backup", qualities: "'128k', '320k', 'flac'") { """
-            return '\(backupURL.absoluteString)';
-            """ }
-        let resolver = LXUserAPIService(sourceSnapshot: { (0, [preferred, backup]) },
-                                        platformFallbackEnabled: { false })
-        let track = Self.track()
-        await #expect(throws: DownloadQualityError.self) {
-            try await resolver.resolveDownloadMusicURL(for: track, quality: AudioQuality.lossless.rawValue)
-        }
-        await #expect(throws: LXUserAPIService.LXError.self) {
-            try await resolver.resolveDownloadMusicURL(for: track, quality: AudioQuality.standard.rawValue)
-        }
-        let exact = try await resolver.resolveDownloadMusicURL(for: track, quality: AudioQuality.hires.rawValue)
-        #expect(exact.quality == "flac24bit")
-        #expect(exact.url.host == "selected.example.invalid")
-        #expect(exact.qualityIsVerified == false)
-        let streaming = try await resolver.resolveMusicURL(for: track, quality: AudioQuality.standard.rawValue)
-        #expect(streaming.url == backupURL)
-    }
-
-    @Test("Downloaded audio is measured in both AAC tiers and FLAC bit depths")
-    func measuresAudioTiers() throws {
-        let formats: [(String, String, AudioQuality, AudioQuality)] = [
-            ("tone-128", "m4a", .standard, .exhigh),
-            ("tone-320", "m4a", .exhigh, .standard),
-            ("tone-16", "flac", .lossless, .hires),
-            ("tone-24", "flac", .hires, .lossless),
+    @Test("Exhaustion distinguishes missing tiers, resolution failure, authorization and wrong audio")
+    func exhaustedCandidatesReportSpecificReasons() async throws {
+        let lower = try Self.fixture("tone-128", "m4a")
+        let server = try await LocalAudioServer([
+            "/forbidden": [Reply(status: 403)],
+            "/lower": [Reply(contentType: "audio/mp4", audio: lower)],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sources = [
+            Self.source(id: "restricted", qualities: "'320k'") { "return '\(server.url("/forbidden").absoluteString)';" },
+            Self.source(id: "unavailable", qualities: "'128k'") { "throw Error('do not call me');" },
+            Self.source(id: "resolution", qualities: "'320k'") { "throw Error('private token');" },
+            Self.source(id: "lower", qualities: "'320k'") { "return '\(server.url("/lower").absoluteString)';" },
         ]
-        for (name, ext, exact, mismatch) in formats {
+        let resolver = LXUserAPIService(sourceSnapshot: { (0, sources) })
+        let downloads = DownloadManager(directory: directory, findDownload: resolver.findDownload)
+        let track = Self.track()
+        await (try #require(downloads.download(track, quality: .exhigh))).value
+        let message = try #require(downloads.failures[DownloadManager.key(for: track)]?.message)
+        for reason in ["所有可用音源", "要求身份验证", "音质不符", "未提供所选音质", "有效地址"] {
+            #expect(message.contains(reason))
+        }
+        #expect(!message.contains("private token"))
+        #expect(downloads.records.isEmpty)
+        #expect(try Self.stagedFiles(in: directory).isEmpty)
+    }
+
+    @Test("A cross-platform download requires a unique same recording and uses that platform's ID")
+    func crossCatalogueRejectsOtherEditAndUsesMatchedID() async throws {
+        let verified = try Self.fixture("tone-16", "flac")
+        let server = try await LocalAudioServer(["/exact": [Reply(contentType: "application/flac", audio: verified)]])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let original = Self.track(source: "wy")
+        let exact = Self.track(songmid: "matched-qq-id")
+        let other = Self.track(album: "Tests (Live)", songmid: "other-qq-id")
+        let ambiguous = Self.track(songmid: "second-qq-id")
+        #expect(SearchRecordingGroups.uniqueDownloadMatch(original, among: [exact, other]) == exact)
+        #expect(SearchRecordingGroups.uniqueDownloadMatch(original, among: [exact, ambiguous]) == nil)
+        #expect(SearchRecordingGroups.uniqueDownloadMatch(original, among: [Self.track(artist: "Another singer")]) == nil)
+
+        let source = Self.source(id: "qq", qualities: "'flac'") {
+            """
+            if (info.type === 'flac' && info.musicInfo.songmid === 'matched-qq-id')
+                return '\(server.url("/exact").absoluteString)';
+            throw Error('wrong recording');
+            """
+        }
+        var match = other
+        let resolver = LXUserAPIService(sourceSnapshot: { (0, [source]) }, downloadMatch: { _, _ in match },
+                                        platformFallbackEnabled: { false })
+        let downloads = DownloadManager(directory: directory, findDownload: resolver.findDownload)
+        await (try #require(downloads.download(original, quality: .lossless))).value
+        #expect(downloads.records.isEmpty)
+        let failure = try #require(downloads.failures[DownloadManager.key(for: original)])
+        #expect(failure.message.contains("同一录音"))
+        #expect(!failure.message.contains("有效地址"))
+
+        match = exact
+        await (try #require(downloads.retry(failure))).value
+        let record = try #require(downloads.record(for: original))
+        #expect(record.track.source == "wy")
+        #expect(record.sourcePlatform == "tx")
+        #expect(try Data(contentsOf: downloads.fileURL(for: record)) == verified)
+        #expect(try Self.stagedFiles(in: directory).isEmpty)
+    }
+
+    @Test("Downloaded audio is measured in both AAC tiers, FLAC and ALAC bit depths")
+    func measuresAudioTiers() throws {
+        let formats: [(String, String, AudioQuality)] = [
+            ("tone-128", "m4a", .standard), ("tone-320", "m4a", .exhigh),
+            ("tone-16", "flac", .lossless), ("tone-24", "flac", .hires),
+            ("tone-alac", "m4a", .lossless),
+        ]
+        for (name, ext, exact) in formats {
             let audio = try #require(DownloadAudioQuality.inspect(Self.fixtureURL(name, ext)))
             #expect(audio.matches(exact))
-            #expect(!audio.matches(mismatch))
         }
+        let flac16 = try #require(DownloadAudioQuality.inspect(Self.fixtureURL("tone-16", "flac")))
+        let flac24 = try #require(DownloadAudioQuality.inspect(Self.fixtureURL("tone-24", "flac")))
+        #expect(!flac16.matches(.hires))
+        #expect(flac24.matches(.lossless))
+        #expect(!DownloadAudioQuality(codec: "AAC", bitRate: 199_000, bitDepth: nil).matches(.exhigh))
+        #expect(DownloadAudioQuality(codec: "MP3", bitRate: 149_000, bitDepth: nil).matches(.standard))
+        #expect(!DownloadAudioQuality(codec: "FLAC", bitRate: nil, bitDepth: nil).canCompare(to: .hires))
     }
 
     @Test("An incorrect replacement leaves the old copy, and a verified alternative replaces it")
@@ -295,11 +355,9 @@ struct OfflineDownloadTests {
         #expect(try Self.stagedFiles(in: directory).isEmpty)
 
         sourceID = "different-script"
-        downloads.retry(failure)
-        #expect(downloads.activeDownloads.isEmpty)
-        #expect(requests == 2)
         #expect(!downloads.alreadyDownloaded(track, quality: .standard))
-        await (try #require(downloads.download(track, quality: .lossless))).value
+        await (try #require(downloads.retry(failure))).value
+        #expect(requests == 3)
         let replacement = try #require(downloads.record(for: track))
         #expect(replacement.sourceID == "different-script")
         #expect(replacement.qualityLabel == "实际 FLAC 16-bit")
@@ -395,7 +453,7 @@ struct OfflineDownloadTests {
         )
     }
 
-    private static func resolver(url: URL, match: (@MainActor (Track, String) async -> Track?)? = nil) -> LXUserAPIService {
+    private static func resolver(url: URL) -> LXUserAPIService {
         let source = LXSourceStore.Source(
             id: "offline-audio-fixture", name: "Offline WAV fixture",
             description: "Synthetic test audio", version: "1.0.0", author: "iMusic tests",
@@ -406,14 +464,14 @@ struct OfflineDownloadTests {
                 })
                 """, sourceURL: nil
         )
-        return LXUserAPIService(sourceSnapshot: { (0, [source]) },
-                                catalogueMatch: match, platformFallbackEnabled: { true })
+        return LXUserAPIService(sourceSnapshot: { (0, [source]) })
     }
 
-    private static func track(source: String = "tx", duration: Int = 2) -> Track {
-        Track(id: 123, name: "Local test tone", artists: [ArtistRef(id: 1, name: "Fixture")],
-              album: AlbumRef(id: 1, name: "Tests", picUrl: nil), durationMS: duration * 1000,
-              source: source, sourceMetadata: ["songmid": "synthetic-audio"])
+    private static func track(source: String = "tx", duration: Int = 2, artist: String = "Fixture",
+                              album: String = "Tests", songmid: String = "synthetic-audio") -> Track {
+        Track(id: 123, name: "Local test tone", artists: [ArtistRef(id: 1, name: artist)],
+              album: AlbumRef(id: 1, name: album, picUrl: nil), durationMS: duration * 1000,
+              source: source, sourceMetadata: ["songmid": songmid])
     }
 
     private static func temporaryDirectory() throws -> URL {
@@ -451,6 +509,20 @@ struct OfflineDownloadTests {
             append(Int16(sin(2 * Double.pi * 440 * Double(sample) / Double(sampleRate)) * 2_000))
         }
         return data
+    }
+}
+
+private extension DownloadManager {
+    /// Use one synthetic route for tests unrelated to source iteration.
+    convenience init(directory: URL, musicDirectory: URL? = nil,
+                     resolve: @escaping @MainActor (Track, String) async throws -> LXUserAPIService.ResolvedURL,
+                     sourceRevision: @escaping @MainActor () -> Int = { 0 },
+                     selectedSourceID: @escaping @MainActor () -> String? = { nil }) {
+        self.init(directory: directory, musicDirectory: musicDirectory, findDownload: { track, quality, verify in
+            let resolved = try await resolve(track, quality.rawValue)
+            guard resolved.quality == quality.lxType else { throw DownloadAttemptFailure.missingQuality }
+            return try await verify(DownloadCandidate(url: resolved.url, track: track, sourceID: selectedSourceID()))
+        }, sourceRevision: sourceRevision, selectedSourceID: selectedSourceID)
     }
 }
 

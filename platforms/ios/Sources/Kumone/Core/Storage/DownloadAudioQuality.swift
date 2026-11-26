@@ -3,16 +3,16 @@ import AudioToolbox
 import Foundation
 
 enum DownloadQualityError: LocalizedError {
-    case unavailable, unsupportedVerification
-    case mismatch(String?)
+    case unsupportedVerification
+    case mismatch(String)
+    case unverifiable(String?)
 
     var errorDescription: String? {
         switch self {
-        case .unavailable: return "所选音源未提供这首歌的指定音质"
-        case .unsupportedVerification: return "当前无法校验这档音质，请选择 128、320 kbps 或 FLAC"
-        case .mismatch(let received):
-            if let received { return "文件音质与所选音质不符（收到 \(received)）" }
-            return "无法确认返回文件符合所选音质"
+        case .unsupportedVerification: return "当前无法校验这档音质，请选择 128、320 kbps 或无损档位"
+        case .mismatch(let received): return "文件音质与所选音质不符（收到 \(received)）"
+        case .unverifiable(let received):
+            return received.map { "无法核验返回文件的所选音质（识别为 \($0)）" } ?? "无法核验返回文件的编码或音质"
         }
     }
 }
@@ -32,19 +32,32 @@ struct DownloadAudioQuality: Codable, Hashable {
     func matches(_ quality: AudioQuality) -> Bool {
         switch quality {
         case .standard:
-            return isLossy && bitRate.map { (125_440...130_560).contains($0) } == true
+            return isLossy && bitRate.map { (125_440...160_000).contains($0) } == true
         case .higher, .exhigh:
-            return isLossy && bitRate.map { (313_600...326_400).contains($0) } == true
+            return isLossy && bitRate.map { (313_600...384_000).contains($0) } == true
         case .lossless:
-            return codec == "FLAC" && bitDepth == 16
+            return isLossless && bitDepth.map { $0 >= 16 } == true
         case .hires:
-            return codec == "FLAC" && bitDepth == 24
+            return isLossless && bitDepth.map { $0 >= 24 } == true
+        case .master, .atmos, .dolby, .surround:
+            return false
+        }
+    }
+
+    func canCompare(to quality: AudioQuality) -> Bool {
+        switch quality {
+        case .standard, .higher, .exhigh:
+            return isLossy ? bitRate != nil : isLossless
+        case .lossless, .hires:
+            return isLossless ? bitDepth != nil : isLossy
         case .master, .atmos, .dolby, .surround:
             return false
         }
     }
 
     private var isLossy: Bool { codec == "MP3" || codec == "AAC" }
+
+    private var isLossless: Bool { codec == "FLAC" || codec == "ALAC" || codec == "PCM" }
 
     static func inspect(_ url: URL) -> Self? {
         var file: AudioFileID?
@@ -63,7 +76,8 @@ struct DownloadAudioQuality: Codable, Hashable {
         case kAudioFormatMPEG4AAC, kAudioFormatMPEG4AAC_HE, kAudioFormatMPEG4AAC_HE_V2: codec = "AAC"
         case kAudioFormatFLAC: codec = "FLAC"
         case kAudioFormatAppleLossless: codec = "ALAC"
-        case kAudioFormatLinearPCM: codec = "PCM"
+        case kAudioFormatLinearPCM:
+            codec = format.mFormatFlags & kAudioFormatFlagIsFloat == 0 ? "PCM" : "PCM Float"
         default: return nil
         }
         var depth = format.mBitsPerChannel
@@ -88,7 +102,11 @@ extension AudioQuality {
     }
 
     var downloadLabel: String {
-        self == .lossless ? "无损 FLAC 16-bit" : sourceDisplayName
+        switch self {
+        case .lossless: return "无损 16-bit 或以上"
+        case .hires: return "Hi-Res 无损 24-bit 或以上"
+        default: return sourceDisplayName
+        }
     }
 }
 #endif

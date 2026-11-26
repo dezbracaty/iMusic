@@ -16,7 +16,15 @@ final class DownloadManager {
         let createdAt: Date
         var publicFileName: String?
         var sourceID: String?
+        var preferredSourceID: String?
+        var sourceName: String?
+        var sourcePlatform: String?
         var audio: DownloadAudioQuality?
+
+        var sourceLabel: String? {
+            guard let sourceName, let sourcePlatform else { return nil }
+            return "\(LXCatalogPlatform.displayName(for: sourcePlatform)) · \(sourceName)"
+        }
 
         var qualityLabel: String {
             if let audio { return "实际 \(audio.label)" }
@@ -30,13 +38,13 @@ final class DownloadManager {
         let track: Track
         let requestedQuality: AudioQuality
         var fraction: Double?
+        var candidateLabel: String?
     }
 
     struct Failure: Identifiable {
         let id: String
         let track: Track
         let requestedQuality: AudioQuality
-        let sourceID: String?
         let message: String
     }
 
@@ -44,7 +52,7 @@ final class DownloadManager {
         directory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Moumusic", isDirectory: true),
         musicDirectory: URL.documentsDirectory.appendingPathComponent("Music", isDirectory: true),
-        resolve: { try await LXUserAPIService.shared.resolveDownloadMusicURL(for: $0, quality: $1) },
+        findDownload: { try await LXUserAPIService.shared.findDownload(for: $0, quality: $1, verify: $2) },
         sourceRevision: { LXSourceStore.shared.configurationRevision },
         selectedSourceID: { LXSourceStore.shared.selectedID },
         notify: { ToastCenter.shared.show($0) }
@@ -59,7 +67,7 @@ final class DownloadManager {
     @ObservationIgnored private var tasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var transfers: [Int: Transfer] = [:]
     @ObservationIgnored private var session: URLSession?
-    private let resolve: @MainActor (Track, String) async throws -> LXUserAPIService.ResolvedURL
+    private let findDownload: FindDownload
     private let sourceRevision: @MainActor () -> Int
     private let selectedSourceID: @MainActor () -> String?
     @ObservationIgnored private var needsReload = false
@@ -78,11 +86,11 @@ final class DownloadManager {
 
     init(directory: URL,
          musicDirectory: URL? = nil,
-         resolve: @escaping @MainActor (Track, String) async throws -> LXUserAPIService.ResolvedURL,
+         findDownload: @escaping FindDownload,
          sourceRevision: @escaping @MainActor () -> Int = { 0 },
          selectedSourceID: @escaping @MainActor () -> String? = { nil },
          notify: @escaping @MainActor (String) -> Void = { _ in }) {
-        self.resolve = resolve
+        self.findDownload = findDownload
         self.sourceRevision = sourceRevision
         self.selectedSourceID = selectedSourceID
         self.notify = notify
@@ -116,16 +124,12 @@ final class DownloadManager {
 
     func alreadyDownloaded(_ track: Track, quality: AudioQuality) -> Bool {
         guard let record = record(for: track) else { return false }
-        if record.sourceID == nil && selectedSourceID() != nil { return false }
-        return record.sourceID == selectedSourceID()
+        return (record.preferredSourceID ?? record.sourceID) == selectedSourceID()
             && record.quality == quality.lxType && record.qualityVerified == true
     }
 
-    func retry(_ failure: Failure) {
-        guard selectedSourceID() == failure.sourceID else {
-            notify("请切回上次选择的 LX 音源后重试，或重新选择下载")
-            return
-        }
+    @discardableResult
+    func retry(_ failure: Failure) -> Task<Void, Never>? {
         download(failure.track, quality: failure.requestedQuality)
     }
 
@@ -169,25 +173,21 @@ final class DownloadManager {
             do {
                 try Task.checkCancellation()
                 guard sourceRevision() == revision else { throw DownloadError.sourceChanged }
-                let resolved = try await resolve(track, requestedQuality.rawValue)
-                try Task.checkCancellation()
-                guard sourceRevision() == revision else { throw DownloadError.sourceChanged }
-                guard resolved.quality == requestedQuality.lxType else { throw DownloadQualityError.unavailable }
-                let staged = try await transfer(from: resolved.url, key: key)
-                defer { try? FileManager.default.removeItem(at: staged) }
-                try await Self.validateAudio(at: staged, expectedDuration: track.duration)
-                try Task.checkCancellation()
-                guard sourceRevision() == revision else { throw DownloadError.sourceChanged }
-
-                let audio = DownloadAudioQuality.inspect(staged)
-                guard let audio, audio.matches(requestedQuality) else {
-                    throw DownloadQualityError.mismatch(audio?.label)
+                let verified = try await findDownload(track, requestedQuality) { candidate in
+                    try checkRevision(revision)
+                    return try await verify(candidate, for: track, quality: requestedQuality, key: key)
                 }
+                let staged = verified.file
+                defer { try? FileManager.default.removeItem(at: staged) }
+                try checkRevision(revision)
                 let fileName = "offline-\(UUID().uuidString).\(staged.pathExtension)"
                 var item = Record(id: key, track: track, quality: requestedQuality.lxType,
                                   qualityVerified: true, fileName: fileName, createdAt: Date())
-                item.sourceID = sourceID
-                item.audio = audio
+                item.preferredSourceID = sourceID
+                item.sourceID = verified.candidate.sourceID
+                item.sourceName = verified.candidate.sourceName
+                item.sourcePlatform = SearchRecordingGroups.source(of: verified.candidate.track)
+                item.audio = verified.audio
                 item.publicFileName = try availableName(for: item)
 
                 try install(item, from: staged)
@@ -201,12 +201,65 @@ final class DownloadManager {
                 guard !Task.isCancelled else { return }
                 let message = Self.message(for: error)
                 failures[key] = Failure(id: key, track: track, requestedQuality: requestedQuality,
-                                        sourceID: sourceID, message: message)
+                                        message: message)
                 notify("《\(track.name)》下载失败：\(message)")
             }
         }
         tasks[key] = task
         return task
+    }
+
+    private func checkRevision(_ revision: Int) throws {
+        try Task.checkCancellation()
+        guard sourceRevision() == revision else { throw DownloadError.sourceChanged }
+    }
+
+    private func verify(_ candidate: DownloadCandidate, for track: Track, quality: AudioQuality,
+                        key: String) async throws -> VerifiedDownload {
+        let platform = SearchRecordingGroups.source(of: candidate.track)
+        if var active = activeDownloads[key] {
+            active.fraction = nil
+            active.candidateLabel = candidate.sourceName.map {
+                "\(LXCatalogPlatform.displayName(for: platform)) · \($0)"
+            }
+            activeDownloads[key] = active
+        }
+        var staged: URL?
+        do {
+            let file = try await transfer(from: candidate.url, key: key)
+            staged = file
+            let crossCatalogue = platform != SearchRecordingGroups.source(of: track)
+            try await Self.validateAudio(at: file, expectedDuration: candidate.track.duration,
+                                         originalDuration: crossCatalogue ? track.duration : nil)
+            try Task.checkCancellation()
+            let audio = DownloadAudioQuality.inspect(file)
+            guard let audio, audio.canCompare(to: quality) else {
+                throw DownloadQualityError.unverifiable(audio?.label)
+            }
+            guard audio.matches(quality) else { throw DownloadQualityError.mismatch(audio.label) }
+            return VerifiedDownload(candidate: candidate, file: file, audio: audio)
+        } catch {
+            if let staged { try? FileManager.default.removeItem(at: staged) }
+            try Task.checkCancellation()
+            if let failure = error as? DownloadError, !failure.isLocalStorageFailure {
+                throw DownloadAttemptFailure.media(failure.localizedDescription)
+            }
+            if let failure = error as? DownloadQualityError {
+                throw DownloadAttemptFailure.media(failure.localizedDescription)
+            }
+            if let failure = error as? URLError, !Self.isLocalFileFailure(failure) {
+                throw DownloadAttemptFailure.media("下载连接失败或超时")
+            }
+            throw error
+        }
+    }
+
+    private static func isLocalFileFailure(_ error: URLError) -> Bool {
+        switch error.code {
+        case .cannotCreateFile, .cannotOpenFile, .cannotCloseFile, .cannotWriteToFile, .cannotRemoveFile, .cannotMoveFile:
+            return true
+        default: return false
+        }
     }
 
     func cancel(_ id: String) { tasks[id]?.cancel() }
@@ -426,22 +479,27 @@ final class DownloadManager {
     private static func message(for error: Error) -> String {
         if let error = error as? DownloadError { return error.localizedDescription }
         if let error = error as? DownloadQualityError { return error.localizedDescription }
+        if let error = error as? DownloadAttemptFailure { return error.localizedDescription }
+        if let error = error as? ExhaustedDownloadCandidates { return error.localizedDescription }
         if error is LXUserAPIService.LXError || error is LXCatalogError {
             return PlaybackFailureMessage.source(error)
         }
         if error is CancellationError { return DownloadError.sourceChanged.localizedDescription }
-        if error is URLError { return "网络传输失败，请检查连接后重试" }
+        if let error = error as? URLError, !isLocalFileFailure(error) {
+            return "网络传输失败，请检查连接后重试"
+        }
         logger.error("Download failed: \(error.localizedDescription, privacy: .private)")
         return DownloadError.storage.localizedDescription
     }
 
-    private static func validateAudio(at url: URL, expectedDuration: TimeInterval) async throws {
+    private static func validateAudio(at url: URL, expectedDuration: TimeInterval, originalDuration: TimeInterval?) async throws {
         guard try Self.hasAudioFileHeader(at: url) else { throw DownloadError.invalidAudio }
         let asset = localAsset(at: url)
         do {
             let (playable, protected, duration) = try await asset.load(.isPlayable, .hasProtectedContent, .duration)
-            guard playable, !protected, duration.seconds.isFinite, duration.seconds > 0,
-                  try await !asset.loadTracks(withMediaType: .audio).isEmpty,
+            guard !protected else { throw DownloadError.protectedAudio }
+            guard playable, duration.seconds.isFinite, duration.seconds > 0,
+                  try await asset.loadTracks(withMediaType: .audio).count == 1,
                   try await asset.loadTracks(withMediaType: .video).isEmpty else {
                 throw DownloadError.invalidAudio
             }
@@ -449,6 +507,14 @@ final class DownloadManager {
             let tolerance = min(10, max(2, expectedDuration * 0.05))
             if expectedDuration > 0, duration.seconds < expectedDuration - tolerance {
                 throw DownloadError.incompleteAudio
+            }
+            if let originalDuration {
+                guard abs(duration.seconds - expectedDuration) <= 2,
+                      abs(duration.seconds - originalDuration) <= 2 else {
+                    throw DownloadError.recordingDurationMismatch
+                }
+            } else if expectedDuration > 0, duration.seconds > expectedDuration + tolerance {
+                throw DownloadError.recordingDurationMismatch
             }
         } catch let error as DownloadError {
             throw error
@@ -469,7 +535,7 @@ final class DownloadManager {
         }
         switch url.pathExtension.lowercased() {
         case "wav": return (matches("RIFF") || matches("RF64")) && matches("WAVE", at: 8)
-        case "aif", "aiff": return matches("FORM") && (matches("AIFF", at: 8) || matches("AIFC", at: 8))
+        case "aif", "aiff", "aifc": return matches("FORM") && (matches("AIFF", at: 8) || matches("AIFC", at: 8))
         case "caf": return matches("caff")
         case "flac": return matches("fLaC") || matches("ID3")
         case "m4a": return matches("ftyp", at: 4)
@@ -526,7 +592,14 @@ final class DownloadManager {
 
 private enum DownloadError: LocalizedError {
     case restricted, unsafeURL, unauthorized, notOffered, invalidAudio, incompleteAudio
-    case tooLarge, http(Int), storage, sourceChanged
+    case tooLarge, http(Int), storage, sourceChanged, protectedAudio, recordingDurationMismatch
+
+    var isLocalStorageFailure: Bool {
+        switch self {
+        case .storage, .sourceChanged: return true
+        default: return false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -535,6 +608,8 @@ private enum DownloadError: LocalizedError {
         case .unauthorized: return "服务器拒绝访问或要求身份验证"
         case .notOffered: return "音源未将此音频提供为下载文件"
         case .invalidAudio: return "文件无法作为无 DRM 音频播放"
+        case .protectedAudio: return "音频文件受 DRM 保护"
+        case .recordingDurationMismatch: return "返回的音频时长与匹配录音不符"
         case .incompleteAudio: return "音频不完整或仅提供试听"
         case .tooLarge: return "音频超过 250 MB 的下载上限"
         case .http(let status): return "服务器返回 HTTP \(status)"
@@ -652,18 +727,19 @@ private final class DownloadSessionDelegate: NSObject, URLSessionDownloadDelegat
             throw DownloadError.tooLarge
         }
         switch response.mimeType?.lowercased() {
-        case "audio/mpeg", "audio/mp3": return "mp3"
+        case "audio/mpeg", "audio/mp3", "audio/x-mpeg", "audio/x-mp3": return "mp3"
         case "audio/mp4", "audio/m4a", "audio/x-m4a": return "m4a"
-        case "audio/flac", "audio/x-flac": return "flac"
+        case "audio/flac", "audio/x-flac", "application/flac": return "flac"
         case "audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave": return "wav"
         case "audio/aac", "audio/aacp", "audio/x-aac": return "aac"
-        case "audio/aiff", "audio/x-aiff": return "aiff"
-        case "application/octet-stream", nil:
+        case "audio/aiff", "audio/x-aiff", "audio/aifc", "audio/x-aifc": return "aiff"
+        case "audio/caf", "audio/x-caf": return "caf"
+        case "application/octet-stream", "application/download", "application/x-download", nil:
             let ext = (response.suggestedFilename.map { ($0 as NSString).pathExtension } ?? "").lowercased()
             let fallback = url.pathExtension.lowercased()
-            let extensions = ["mp3", "m4a", "flac", "wav", "aac", "aif", "aiff", "caf"]
-            if extensions.contains(ext) { return ext }
-            if extensions.contains(fallback) { return fallback }
+            let extensions = ["mp3", "m4a", "mp4", "flac", "wav", "aac", "aif", "aiff", "aifc", "caf"]
+            if extensions.contains(ext) { return ext == "mp4" ? "m4a" : ext }
+            if extensions.contains(fallback) { return fallback == "mp4" ? "m4a" : fallback }
             fallthrough
         default: throw DownloadError.invalidAudio
         }

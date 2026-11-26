@@ -48,6 +48,9 @@ struct DownloadsView: View {
                                 Text(item.requestedQuality.downloadLabel)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                if let candidate = item.candidateLabel {
+                                    Text(candidate).font(.caption).foregroundStyle(.secondary)
+                                }
                                 if let fraction = item.fraction {
                                     ProgressView(value: fraction)
                                         .accessibilityLabel("下载进度")
@@ -114,7 +117,10 @@ struct TrackDownloadMenu: View {
     var body: some View {
         let key = DownloadManager.key(for: track)
         let record = downloads.record(for: track)
-        if let record { Text(record.qualityLabel) }
+        if let record {
+            Text(record.qualityLabel)
+            if let source = record.sourceLabel { Text("下载来源：\(source)") }
+        }
         if let active = downloads.activeDownloads[key] {
             Menu {
                 Button("取消下载") { downloads.cancel(key) }
@@ -151,7 +157,7 @@ struct TrackDownloadMenu: View {
 
     @ViewBuilder
     private func qualityOptions(for candidate: Track) -> some View {
-        Text("\(platformName(for: candidate)) · \(sources.selectedSource?.name ?? "未选择 LX 音源")")
+        Text("优先 \(platformName(for: candidate)) · \(sources.selectedSource?.name ?? "未选择 LX 音源")")
         let preferred = settings.audioQuality
         if !preferred.canVerifyDownload {
             Button("所选音质：\(preferred.downloadLabel)") {

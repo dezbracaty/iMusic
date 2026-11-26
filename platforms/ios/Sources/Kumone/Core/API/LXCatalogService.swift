@@ -168,17 +168,25 @@ enum LXCatalogService {
         if let known = await SearchPlaybackAlternatives.match(sourceTrack, on: platform.rawValue) {
             return known
         }
-        let keyword = [sourceTrack.name, sourceTrack.artistNames]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-        guard !keyword.isEmpty,
-              let candidates = try? await search(keyword, platform: platform, page: 1, limit: 12),
-              !candidates.isEmpty else { return nil }
-
+        let candidates = await catalogueMatches(sourceTrack, on: platform)
         let matches = candidates.filter { SearchRecordingGroups.sameRecording(sourceTrack, $0) }
         let distinctKeys = Set(matches.map(\.playbackKey))
         return distinctKeys.count == 1 ? matches.first : nil
+    }
+
+    static func matchingDownloadTrack(_ track: Track, on platformID: String) async -> Track? {
+        guard let platform = LXCatalogPlatform(rawValue: platformID), platform != .aggregate else { return nil }
+        let candidates = await catalogueMatches(track, on: platform)
+        return SearchRecordingGroups.uniqueDownloadMatch(track, among: candidates)
+    }
+
+    private static func catalogueMatches(_ track: Track, on platform: LXCatalogPlatform) async -> [Track] {
+        let keyword = [track.name, track.artistNames]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !keyword.isEmpty else { return [] }
+        return (try? await search(keyword, platform: platform, page: 1, limit: 12)) ?? []
     }
 
     /// Loads an album as a source-owned detail page. LX sources do not share

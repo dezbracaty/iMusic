@@ -46,15 +46,33 @@ struct SearchRecordingGroups {
         return abs(lhs.duration - rhs.duration) <= 3
     }
 
+    static func sameDownloadRecording(_ lhs: Track, _ rhs: Track) -> Bool {
+        guard sameRecording(lhs, rhs), abs(lhs.duration - rhs.duration) <= 2 else { return false }
+        let album = normalize(lhs.album.name)
+        let unknownAlbums = ["", "未知专辑", "未知", "无专辑", "unknown", "unknown album", "untitled"]
+        guard !unknownAlbums.contains(album), album == normalize(rhs.album.name) else { return false }
+        return lhs.trackNo <= 0 || rhs.trackNo <= 0 || lhs.trackNo == rhs.trackNo
+    }
+
+    static func uniqueDownloadMatch(_ track: Track, among candidates: [Track]) -> Track? {
+        let matches = candidates.filter { sameDownloadRecording(track, $0) }
+        return Set(matches.map(\.playbackKey)).count == 1 ? matches.first : nil
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
     private struct RecordingKey: Hashable {
         let title: String
         let artists: Set<String>
         let versions: Set<String>
 
         init(_ track: Track) {
-            title = Self.normalize(track.name)
+            title = normalize(track.name)
             artists = Set(track.artists.flatMap { $0.name.components(separatedBy: ["/", "&", "、", ",", "，", ";", "；"]) }
-                .map(Self.normalize).filter { !$0.isEmpty })
+                .map(normalize).filter { !$0.isEmpty })
             let details = [track.subtitle ?? "", track.album.name].joined(separator: " ").lowercased()
             let groups = [
                 ["live", "现场", "演唱会"], ["remix", "混音", "dj"],
@@ -69,11 +87,6 @@ struct SearchRecordingGroups {
                     return details.contains(marker)
                 } ? group[0] : nil
             })
-        }
-
-        private static func normalize(_ value: String) -> String {
-            value.folding(options: [.caseInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX"))
-                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
         }
     }
 }
