@@ -19,7 +19,8 @@ typealias FindDownload = @MainActor (
 ) async throws -> VerifiedDownload
 
 enum DownloadAttemptFailure: LocalizedError {
-    case media(String)
+    case transfer(String)
+    case validation(String)
     case noRecording
     case restrictedRecording
     case noInterface
@@ -31,7 +32,7 @@ enum DownloadAttemptFailure: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .media(let reason): return reason
+        case .transfer(let reason), .validation(let reason): return reason
         case .noRecording: return "没有找到可确认的同一录音"
         case .restrictedRecording: return "候选录音受版权、付费或账号限制"
         case .noInterface: return "音源未提供可用平台的播放接口"
@@ -43,9 +44,18 @@ enum DownloadAttemptFailure: LocalizedError {
         }
     }
 
-    var isMediaFailure: Bool {
-        if case .media = self { return true }
-        return false
+    enum Stage: String, CaseIterable {
+        case resolution = "音源解析"
+        case transfer = "直链传输"
+        case validation = "文件核验"
+    }
+
+    var stage: Stage {
+        switch self {
+        case .transfer: return .transfer
+        case .validation: return .validation
+        default: return .resolution
+        }
     }
 }
 
@@ -53,10 +63,14 @@ struct ExhaustedDownloadCandidates: LocalizedError {
     let failures: [DownloadAttemptFailure]
 
     var errorDescription: String? {
-        let ordered = failures.filter(\.isMediaFailure) + failures.filter { !$0.isMediaFailure }
-        var seen = Set<String>()
-        let reasons = ordered.map(\.localizedDescription).filter { seen.insert($0).inserted }
-        return "已尝试所有可用音源。\(reasons.joined(separator: "；"))"
+        let details = DownloadAttemptFailure.Stage.allCases.compactMap { stage -> String? in
+            var seen = Set<String>()
+            let reasons = failures.filter { $0.stage == stage }
+                .map(\.localizedDescription).filter { seen.insert($0).inserted }
+            guard !reasons.isEmpty else { return nil }
+            return "\(stage.rawValue)：\(reasons.joined(separator: "、"))"
+        }
+        return (["已尝试所有可用音源"] + details).joined(separator: "\n")
     }
 }
 #endif

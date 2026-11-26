@@ -70,12 +70,15 @@ struct OfflineDownloadTests {
         #expect(try Self.stagedFiles(in: directory).isEmpty)
     }
 
-    @Test("Unauthorized, streamed, partial, mislabeled and preview responses leave no saved files")
+    @Test("Unauthorized, explicitly restricted, partial, mislabeled and preview responses leave no files")
     func invalidResponses() async throws {
         let audio = Self.wave()
         let server = try await LocalAudioServer([
             "/unauthorized": [Reply(status: 403, audio: audio)],
-            "/inline": [Reply(attachment: false, audio: audio)],
+            "/denied": [Reply(attachment: false, headers: ["X-Download-Allowed: false"], audio: audio)],
+            "/no-store": [Reply(headers: ["Cache-Control: private, no-store"], audio: audio)],
+            "/generic-playlist": [Reply(attachment: false, contentType: "application/octet-stream",
+                                      audio: Data("#EXTM3U\nhttps://example.invalid/segment".utf8))],
             "/partial": [Reply(status: 206, audio: audio)],
             "/playlist": [Reply(audio: Data("#EXTM3U\nhttps://example.invalid/segment".utf8))],
             "/preview": [Reply(audio: audio)],
@@ -87,7 +90,9 @@ struct OfflineDownloadTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let cases: [(String, Int, String)] = [
             ("/unauthorized", 2, "服务器拒绝访问或要求身份验证"),
-            ("/inline", 2, "音源未将此音频提供为下载文件"),
+            ("/denied", 2, "服务器明确限制保存此文件"),
+            ("/no-store", 2, "服务器明确限制保存此文件"),
+            ("/generic-playlist", 2, "文件无法作为无 DRM 音频播放"),
             ("/partial", 2, "音频不完整或仅提供试听"),
             ("/playlist", 2, "文件无法作为无 DRM 音频播放"),
             ("/preview", 60, "音频不完整或仅提供试听"),
@@ -198,12 +203,13 @@ struct OfflineDownloadTests {
         }
     }
 
-    @Test("A selected stream-only URL and a lower-quality backup are skipped before an exact download")
+    @Test("An explicitly restricted URL and a lower-quality backup are skipped before an exact download")
     func fallsBackAfterFetchAndValidationFailures() async throws {
         let lower = try Self.fixture("tone-128", "m4a")
         let verified = try Self.fixture("tone-320", "m4a")
         let server = try await LocalAudioServer([
-            "/inline": [Reply(attachment: false, contentType: "audio/mp4", audio: verified)],
+            "/inline": [Reply(attachment: false, headers: ["Cache-Control: no-store"],
+                              contentType: "audio/mp4", audio: verified)],
             "/lower": [Reply(contentType: "audio/mp4", audio: lower)],
             "/exact": [Reply(contentType: "audio/mp4", audio: verified)],
         ])
@@ -231,6 +237,88 @@ struct OfflineDownloadTests {
         #expect(try Self.stagedFiles(in: directory).isEmpty)
     }
 
+    @Test("A Hi-Res failure can explicitly switch to 320 kbps and save a full headerless MP3")
+    func changesQualityFromFailedItemAndSavesHeaderlessMP3() async throws {
+        let mp3 = try Self.fixture("tone-mp3-320", "mp3")
+        let directPath = "/audio/receipt?token=fixture-secret"
+        let server = try await LocalAudioServer([
+            directPath: [Reply(attachment: false, contentType: "application/octet-stream", audio: mp3)],
+            "/no-store": [Reply(attachment: false, headers: ["Cache-Control: no-store"],
+                               contentType: "audio/mpeg", audio: mp3)],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let preferred = Self.source(id: "preferred", qualities: "'master', 'flac24bit', '320k'", platform: "kg") {
+            """
+            if (info.type === 'flac24bit') return 'http://example.invalid/file?token=fixture-secret';
+            if (info.type === '320k' || info.type === 'master') return '\(server.url(directPath).absoluteString)';
+            throw Error('unexpected tier');
+            """
+        }
+        let backup = Self.source(id: "no-store", qualities: "'flac24bit'", platform: "kg") {
+            "return '\(server.url("/no-store").absoluteString)';"
+        }
+        let lower = Self.source(id: "only-medium", qualities: "'320k'", platform: "kg") {
+            "throw Error('private script detail');"
+        }
+        let resolver = LXUserAPIService(sourceSnapshot: { (0, [preferred, backup, lower]) },
+                                        platformFallbackEnabled: { false })
+        let track = Self.track(source: "kg")
+        let streaming = try await resolver.resolveMusicURL(for: track, quality: AudioQuality.master.rawValue)
+        #expect(streaming.quality == "jymaster")
+        #expect(!streaming.qualityIsVerified)
+
+        let downloads = DownloadManager(directory: directory, findDownload: resolver.findDownload,
+                                        selectedSourceID: { "preferred" })
+        let key = DownloadManager.key(for: track)
+        await (try #require(downloads.download(track, quality: .hires))).value
+        let failure = try #require(downloads.failures[key])
+        #expect(downloads.records.isEmpty)
+        #expect(failure.requestedQuality == .hires)
+        #expect(failure.message.contains("音源解析："))
+        #expect(failure.message.contains("未提供所选音质"))
+        #expect(failure.message.contains("直链传输："))
+        #expect(failure.message.contains("需要 HTTPS"))
+        #expect(failure.message.contains("明确限制保存"))
+        #expect(!failure.message.contains("fixture-secret"))
+        #expect(try Self.stagedFiles(in: directory).isEmpty)
+
+        #expect(downloads.alternativeQualities(for: failure).contains(.exhigh))
+        #expect(!downloads.alternativeQualities(for: failure).contains(.hires))
+        let changed = try #require(downloads.retry(failure, quality: .exhigh))
+        #expect(downloads.activeDownloads[key]?.requestedQuality == .exhigh)
+        await changed.value
+        let record = try #require(downloads.record(for: track))
+        #expect(record.quality == "320k")
+        #expect(record.audio?.bitRate.map { (319_900...320_100).contains($0) } == true)
+        #expect(record.qualityLabel == "实际 MP3 约 320 kbps")
+        let file = downloads.fileURL(for: record)
+        #expect(file.pathExtension == "mp3")
+        #expect(try Data(contentsOf: file) == mp3)
+        #expect(downloads.failures[key] == nil)
+    }
+
+    @Test("An authorized inline audio file is saved without attachment")
+    func acceptsInlineAudio() async throws {
+        let audio = try Self.fixture("tone-mp3-320", "mp3")
+        let server = try await LocalAudioServer([
+            "/audio": [Reply(attachment: false, headers: ["Content-Disposition: inline"],
+                            contentType: "audio/mpeg", audio: audio)],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let downloads = DownloadManager(directory: directory) { _, _ in
+            .init(url: server.url("/audio"), quality: "320k")
+        }
+        let track = Self.track()
+        await (try #require(downloads.download(track, quality: .exhigh))).value
+        let record = try #require(downloads.record(for: track))
+        #expect(try Data(contentsOf: downloads.fileURL(for: record)) == audio)
+    }
+
     @Test("Exhaustion distinguishes missing tiers, resolution failure, authorization and wrong audio")
     func exhaustedCandidatesReportSpecificReasons() async throws {
         let lower = try Self.fixture("tone-128", "m4a")
@@ -252,7 +340,8 @@ struct OfflineDownloadTests {
         let track = Self.track()
         await (try #require(downloads.download(track, quality: .exhigh))).value
         let message = try #require(downloads.failures[DownloadManager.key(for: track)]?.message)
-        for reason in ["所有可用音源", "要求身份验证", "音质不符", "未提供所选音质", "有效地址"] {
+        for reason in ["所有可用音源", "音源解析：", "直链传输：", "文件核验：",
+                       "要求身份验证", "音质不符", "未提供所选音质", "有效地址"] {
             #expect(message.contains(reason))
         }
         #expect(!message.contains("private token"))
@@ -441,13 +530,14 @@ struct OfflineDownloadTests {
         try Data(contentsOf: fixtureURL(name, ext))
     }
 
-    private static func source(id: String, qualities: String, body: () -> String) -> LXSourceStore.Source {
+    private static func source(id: String, qualities: String, platform: String = "tx",
+                               body: () -> String) -> LXSourceStore.Source {
         LXSourceStore.Source(
             id: id, name: id, description: "Synthetic test audio", version: "1.0.0",
             author: "iMusic tests", homepage: "", script: """
                 lx.on(lx.EVENT_NAMES.request, async ({ info }) => { \(body()) })
                 lx.send(lx.EVENT_NAMES.inited, {
-                    status: true, sources: { tx: { type: 'music', actions: ['musicUrl'], qualitys: [\(qualities)] } }
+                    status: true, sources: { \(platform): { type: 'music', actions: ['musicUrl'], qualitys: [\(qualities)] } }
                 })
                 """, sourceURL: nil
         )

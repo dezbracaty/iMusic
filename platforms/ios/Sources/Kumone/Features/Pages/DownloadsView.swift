@@ -69,19 +69,31 @@ struct DownloadsView: View {
             if !downloads.failures.isEmpty {
                 Section("下载失败") {
                     ForEach(downloads.failures.values.sorted { $0.id < $1.id }) { item in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(item.track.name)
-                                Text(item.requestedQuality.downloadLabel)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(item.message)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(item.track.name)
+                            Text("请求：\(item.requestedQuality.downloadLabel)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(item.message)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            HStack(spacing: 16) {
+                                if item.requestedQuality.canVerifyDownload {
+                                    Button("重试原档位") { downloads.retry(item) }
+                                        .accessibilityIdentifier("retryOriginalDownloadQuality")
+                                }
+                                let alternatives = downloads.alternativeQualities(for: item)
+                                if !alternatives.isEmpty {
+                                    Menu("换档下载") {
+                                        ForEach(alternatives) { quality in
+                                            Button(quality.downloadLabel) { downloads.retry(item, quality: quality) }
+                                                .accessibilityIdentifier("retryDownload-\(quality.lxType)")
+                                        }
+                                    }
+                                    .accessibilityIdentifier("changeDownloadQuality")
+                                }
                             }
-                            Spacer()
-                            Button("重试") { downloads.retry(item) }
-                                .buttonStyle(.borderless)
+                            .buttonStyle(.borderless)
                         }
                         .swipeActions {
                             Button("移除", role: .destructive) { downloads.dismissFailure(item.id) }
