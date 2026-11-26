@@ -66,35 +66,31 @@ final class DownloadManager {
     private(set) var storageError: String?
 
     @ObservationIgnored private var tasks: [String: Task<Void, Never>] = [:]
-    @ObservationIgnored private var transfers: [Int: Transfer] = [:]
     @ObservationIgnored private var session: URLSession?
     private let findDownload: FindDownload
     private let sourceRevision: @MainActor () -> Int
     private let selectedSourceID: @MainActor () -> String?
     @ObservationIgnored private var needsReload = false
     private let notify: @MainActor (String) -> Void
+    private let reportTransfer: @Sendable (DownloadTransferReport) -> Void
 
     private let manifestURL: URL
     private let downloadDirectory: URL
     private let stagingDirectory: URL
     private let musicDirectory: URL
 
-    private struct Transfer {
-        let key: String
-        let task: URLSessionDownloadTask
-        let continuation: CheckedContinuation<URL, Error>
-    }
-
     init(directory: URL,
          musicDirectory: URL? = nil,
          findDownload: @escaping FindDownload,
          sourceRevision: @escaping @MainActor () -> Int = { 0 },
          selectedSourceID: @escaping @MainActor () -> String? = { nil },
-         notify: @escaping @MainActor (String) -> Void = { _ in }) {
+         notify: @escaping @MainActor (String) -> Void = { _ in },
+         reportTransfer: @escaping @Sendable (DownloadTransferReport) -> Void = { _ in }) {
         self.findDownload = findDownload
         self.sourceRevision = sourceRevision
         self.selectedSourceID = selectedSourceID
         self.notify = notify
+        self.reportTransfer = reportTransfer
         self.musicDirectory = musicDirectory ?? directory.appendingPathComponent("Documents/Music", isDirectory: true)
         manifestURL = directory.appendingPathComponent("downloads.json")
         downloadDirectory = directory.appendingPathComponent("Downloads", isDirectory: true)
@@ -182,9 +178,11 @@ final class DownloadManager {
             do {
                 try Task.checkCancellation()
                 guard sourceRevision() == revision else { throw DownloadError.sourceChanged }
+                let allowance = DownloadUnverifiedAllowance()
                 let verified = try await findDownload(track, requestedQuality) { candidate in
                     try checkRevision(revision)
-                    return try await verify(candidate, for: track, quality: requestedQuality, key: key)
+                    return try await verify(candidate, for: track, quality: requestedQuality, key: key,
+                                            allowance: allowance)
                 }
                 let staged = verified.file
                 defer { try? FileManager.default.removeItem(at: staged) }
@@ -230,7 +228,7 @@ final class DownloadManager {
     }
 
     private func verify(_ candidate: DownloadCandidate, for track: Track, quality: AudioQuality,
-                        key: String) async throws -> VerifiedDownload {
+                        key: String, allowance: DownloadUnverifiedAllowance) async throws -> VerifiedDownload {
         let platform = SearchRecordingGroups.source(of: candidate.track)
         if var active = activeDownloads[key] {
             active.fraction = nil
@@ -241,7 +239,8 @@ final class DownloadManager {
         }
         var staged: URL?
         do {
-            let file = try await transfer(from: candidate.url, key: key)
+            let file = try await transfer(from: candidate.url, quality: quality, key: key,
+                                          allowance: allowance)
             staged = file
             let crossCatalogue = platform != SearchRecordingGroups.source(of: track)
             try await Self.validateAudio(at: file, expectedDuration: candidate.track.duration,
@@ -257,7 +256,7 @@ final class DownloadManager {
             if let staged { try? FileManager.default.removeItem(at: staged) }
             try Task.checkCancellation()
             if let failure = error as? DownloadError, !failure.isLocalStorageFailure {
-                if staged != nil || failure == .invalidAudio {
+                if staged != nil || failure == .invalidAudio || failure == .probeBudget {
                     throw DownloadAttemptFailure.validation(failure.localizedDescription)
                 }
                 throw DownloadAttemptFailure.transfer(failure.localizedDescription)
@@ -266,6 +265,9 @@ final class DownloadManager {
                 throw DownloadAttemptFailure.validation(failure.localizedDescription)
             }
             if let failure = error as? URLError, !Self.isLocalFileFailure(failure) {
+                if failure.code == .userAuthenticationRequired || failure.code == .userCancelledAuthentication {
+                    throw DownloadAttemptFailure.transfer(DownloadError.unauthorized.localizedDescription)
+                }
                 if Self.isTLSFailure(failure) {
                     throw DownloadAttemptFailure.transfer("HTTPS 连接或证书校验失败")
                 }
@@ -576,54 +578,22 @@ final class DownloadManager {
         }
     }
 
-    private func transfer(from url: URL, key: String) async throws -> URL {
-        guard DownloadSessionDelegate.permits(url) else { throw DownloadError.unsafeURL }
-        let session: URLSession
-        if let current = self.session {
-            session = current
-        } else {
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.httpShouldSetCookies = false
-            configuration.httpCookieStorage = nil
-            configuration.urlCredentialStorage = nil
-            configuration.timeoutIntervalForRequest = 30
-            configuration.timeoutIntervalForResource = 15 * 60
-            session = URLSession(configuration: configuration,
-                                 delegate: DownloadSessionDelegate(owner: self, stagingDirectory: stagingDirectory),
-                                 delegateQueue: nil)
-            self.session = session
-        }
-        let task = session.downloadTask(with: url)
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                transfers[task.taskIdentifier] = Transfer(key: key, task: task, continuation: continuation)
-                task.resume()
-            }
-        } onCancel: {
-            task.cancel()
-        }
-    }
-
-    fileprivate func updateProgress(taskID: Int, fraction: Double) {
-        guard let key = transfers[taskID]?.key, var item = activeDownloads[key],
-              fraction > (item.fraction ?? 0) else { return }
-        item.fraction = fraction
-        activeDownloads[key] = item
-    }
-
-    fileprivate func finishTransfer(taskID: Int, result: Result<URL, Error>) {
-        guard let transfer = transfers.removeValue(forKey: taskID) else {
-            if let url = try? result.get() { try? FileManager.default.removeItem(at: url) }
-            return
-        }
-        if case .failure = result { transfer.task.cancel() }
-        transfer.continuation.resume(with: result)
+    private func transfer(from url: URL, quality: AudioQuality, key: String,
+                          allowance: DownloadUnverifiedAllowance) async throws -> URL {
+        let current = session ?? DownloadStream.makeSession()
+        session = current
+        return try await DownloadStream.fetch(url, quality: quality, session: current, stagingDirectory: stagingDirectory,
+                                              allowance: allowance, progress: { fraction in
+            guard var item = self.activeDownloads[key] else { return }
+            item.fraction = fraction
+            self.activeDownloads[key] = item
+        }, report: reportTransfer)
     }
 }
 
-private enum DownloadError: LocalizedError, Equatable {
+enum DownloadError: LocalizedError, Equatable {
     case restricted, unsafeURL, unauthorized, saveProhibited, invalidAudio, incompleteAudio
-    case tooLarge, http(Int), storage, sourceChanged, protectedAudio, recordingDurationMismatch
+    case tooLarge, http(Int), storage, sourceChanged, protectedAudio, recordingDurationMismatch, probeBudget
 
     var isLocalStorageFailure: Bool {
         switch self {
@@ -643,6 +613,7 @@ private enum DownloadError: LocalizedError, Equatable {
         case .recordingDurationMismatch: return "返回的音频时长与匹配录音不符"
         case .incompleteAudio: return "音频不完整或仅提供试听"
         case .tooLarge: return "音频超过 250 MB 的下载上限"
+        case .probeBudget: return "探测无法确认音质，本次已尝试过一个需要整文件核验的候选"
         case .http(let status): return "服务器返回 HTTP \(status)"
         case .storage: return "无法访问下载存储，请检查设备空间后重试"
         case .sourceChanged: return "音源配置已更改，请重试"
@@ -650,178 +621,4 @@ private enum DownloadError: LocalizedError, Equatable {
     }
 }
 
-private final class DownloadSessionDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
-    private weak var owner: DownloadManager?
-    private let stagingDirectory: URL
-    private static let maximumBytes: Int64 = 250_000_000
-
-    init(owner: DownloadManager, stagingDirectory: URL) {
-        self.owner = owner
-        self.stagingDirectory = stagingDirectory
-    }
-
-    static func permits(_ url: URL) -> Bool {
-        guard let host = url.host?.lowercased(), !host.isEmpty,
-              url.user == nil, url.password == nil else { return false }
-        if url.scheme?.lowercased() == "https" { return true }
-        return url.scheme?.lowercased() == "http" && ["localhost", "127.0.0.1", "::1", "[::1]"].contains(host)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask,
-                    willPerformHTTPRedirection response: HTTPURLResponse,
-                    newRequest request: URLRequest,
-                    completionHandler: @escaping (URLRequest?) -> Void) {
-        if Self.explicitlyDeniesDownload(response) {
-            finish(task, with: .failure(DownloadError.saveProhibited))
-            completionHandler(nil)
-            return
-        }
-        guard let url = request.url, Self.permits(url),
-              response.url?.scheme != "https" || url.scheme == "https" else {
-            finish(task, with: .failure(DownloadError.unsafeURL))
-            completionHandler(nil)
-            return
-        }
-        completionHandler(request)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask,
-                    didReceive challenge: URLAuthenticationChallenge,
-                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust {
-            completionHandler(.performDefaultHandling, nil)
-        } else {
-            finish(task, with: .failure(DownloadError.unauthorized))
-            completionHandler(.cancelAuthenticationChallenge, nil)
-        }
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didWriteData bytesWritten: Int64,
-                    totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        do {
-            _ = try Self.extensionHint(response: downloadTask.response, bytes: totalBytesWritten)
-        } catch {
-            finish(downloadTask, with: .failure(error))
-            return
-        }
-        guard totalBytesExpectedToWrite > 0 else { return }
-        let fraction = min(100, floor(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) * 100)) / 100
-        Task { @MainActor [weak owner] in
-            owner?.updateProgress(taskID: downloadTask.taskIdentifier, fraction: fraction)
-        }
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didFinishDownloadingTo location: URL) {
-        do {
-            let size = try location.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-            let hint = try Self.extensionHint(response: downloadTask.response, bytes: Int64(size))
-            guard size > 0,
-                  let ext = try hint ?? Self.detectAudioExtension(at: location) else { throw DownloadError.invalidAudio }
-            let destination = stagingDirectory.appendingPathComponent("\(UUID().uuidString).\(ext)")
-            // URLSession removes its temporary file when this callback returns.
-            try FileManager.default.moveItem(at: location, to: destination)
-            finish(downloadTask, with: .success(destination))
-        } catch {
-            finish(downloadTask, with: .failure(error))
-        }
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let error { finish(task, with: .failure(error)) }
-    }
-
-    private func finish(_ task: URLSessionTask, with result: Result<URL, Error>) {
-        Task { @MainActor [weak owner] in
-            if let owner {
-                owner.finishTransfer(taskID: task.taskIdentifier, result: result)
-            } else if let url = try? result.get() {
-                try? FileManager.default.removeItem(at: url)
-            }
-        }
-    }
-
-    private static func explicitlyDeniesDownload(_ response: HTTPURLResponse) -> Bool {
-        let allowed = response.value(forHTTPHeaderField: "X-Download-Allowed")?
-            .trimmingCharacters(in: .whitespaces).lowercased()
-        return allowed.map { ["false", "0", "no"].contains($0) } == true
-    }
-
-    private static func extensionHint(response: URLResponse?, bytes: Int64) throws -> String? {
-        guard let response = response as? HTTPURLResponse else { throw DownloadError.invalidAudio }
-        guard let url = response.url, permits(url) else { throw DownloadError.unsafeURL }
-        switch response.statusCode {
-        case 200: break
-        case 401, 403, 407: throw DownloadError.unauthorized
-        case 451: throw DownloadError.saveProhibited
-        case 206: throw DownloadError.incompleteAudio
-        default: throw DownloadError.http(response.statusCode)
-        }
-        guard response.value(forHTTPHeaderField: "Content-Range") == nil else {
-            throw DownloadError.incompleteAudio
-        }
-        let cacheDirectives = response.value(forHTTPHeaderField: "Cache-Control")?
-            .lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } ?? []
-        guard !explicitlyDeniesDownload(response), !cacheDirectives.contains("no-store") else {
-            throw DownloadError.saveProhibited
-        }
-        // Content-Disposition describes presentation. A full direct audio
-        // response can be saved even when the server uses inline or omits it.
-        guard bytes <= maximumBytes, response.expectedContentLength <= maximumBytes else {
-            throw DownloadError.tooLarge
-        }
-        switch response.mimeType?.lowercased() {
-        case "audio/mpeg", "audio/mp3", "audio/x-mpeg", "audio/x-mp3": return "mp3"
-        case "audio/mp4", "audio/m4a", "audio/x-m4a": return "m4a"
-        case "audio/flac", "audio/x-flac", "application/flac": return "flac"
-        case "audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave": return "wav"
-        case "audio/aac", "audio/aacp", "audio/x-aac": return "aac"
-        case "audio/aiff", "audio/x-aiff", "audio/aifc", "audio/x-aifc": return "aiff"
-        case "audio/caf", "audio/x-caf": return "caf"
-        case "application/octet-stream", "application/download", "application/x-download", nil:
-            let ext = (response.suggestedFilename.map { ($0 as NSString).pathExtension } ?? "").lowercased()
-            let fallback = url.pathExtension.lowercased()
-            let extensions = ["mp3", "m4a", "mp4", "flac", "wav", "aac", "aif", "aiff", "aifc", "caf"]
-            if extensions.contains(ext) { return ext == "mp4" ? "m4a" : ext }
-            if extensions.contains(fallback) { return fallback == "mp4" ? "m4a" : fallback }
-            return nil
-        default: throw DownloadError.invalidAudio
-        }
-    }
-
-    /// Generic, extensionless CDN responses get a bounded container probe.
-    /// HTML, JSON and HLS cannot reach AVFoundation through this path.
-    private static func detectAudioExtension(at url: URL) throws -> String? {
-        let file = try FileHandle(forReadingFrom: url)
-        defer { try? file.close() }
-        var header = [UInt8](try file.read(upToCount: 12) ?? Data())
-        if header.count >= 10, header.starts(with: "ID3".utf8) {
-            // ID3's four size bytes are synchsafe. Seek past the tag without
-            // reading its contents, then inspect the audio frame or marker.
-            let sizeBytes = header[6..<10]
-            guard sizeBytes.allSatisfy({ $0 < 128 }) else { return nil }
-            let size = sizeBytes.reduce(0) { ($0 << 7) | Int($1) }
-            let footer = header[3] == 4 && header[5] & 0x10 != 0 ? 10 : 0
-            try file.seek(toOffset: UInt64(10 + size + footer))
-            header = [UInt8](try file.read(upToCount: 12) ?? Data())
-        }
-        guard header.count == 12 else { return nil }
-        if header.starts(with: "fLaC".utf8) { return "flac" }
-        if header.starts(with: "caff".utf8) { return "caf" }
-        if header.dropFirst(4).starts(with: "ftyp".utf8) { return "m4a" }
-        if header.dropFirst(8).starts(with: "WAVE".utf8),
-           header.starts(with: "RIFF".utf8) || header.starts(with: "RF64".utf8) { return "wav" }
-        if header.starts(with: "FORM".utf8),
-           header.dropFirst(8).starts(with: "AIFF".utf8) || header.dropFirst(8).starts(with: "AIFC".utf8) {
-            return "aiff"
-        }
-        guard header[0] == 0xff, header[1] & 0xe0 == 0xe0 else { return nil }
-        switch header[1] & 0x06 {
-        case 0 where header[1] & 0xf0 == 0xf0: return "aac"
-        case 2 where header[1] & 0x18 != 0x08: return "mp3"
-        default: return nil
-        }
-    }
-}
 #endif

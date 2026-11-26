@@ -111,6 +111,7 @@ struct OfflineDownloadTests {
             #expect(downloads.activeDownloads.isEmpty)
             #expect(try Self.stagedFiles(in: directory).isEmpty)
         }
+        #expect(server.requestedPaths == cases.map { $0.0 })
     }
 
     @Test("A cancelled or stale resolution can be retried without installing a file")
@@ -381,6 +382,232 @@ struct OfflineDownloadTests {
         #expect(downloads.records.isEmpty)
         #expect(server.requestedPaths == ["/same-url", "/alias-flac16", "/alias-aac"])
         #expect(try Self.stagedFiles(in: directory).isEmpty)
+    }
+
+    @Test("A large AAC false Hi-Res is rejected from its prefix and FLAC continues on one GET")
+    func stopsWrongHiResBeforeTheWholeFile() async throws {
+        var aac = try Self.fixture("tone-192", "m4a")
+        // Append a valid free atom so the first candidate is much larger
+        // than the probe window without changing its AAC sample table.
+        aac.append(Self.boxHeader(size: 2_000_008, type: "free"))
+        aac.append(Data(repeating: 0, count: 2_000_000))
+        let flac = try Self.fixture("tone-24", "flac")
+        var padded = Data(flac.prefix(42))
+        let last = padded[4] & 0x80
+        padded[4] &= 0x7f
+        padded.append(contentsOf: [last | 1, 0x0f, 0x42, 0x40])
+        padded.append(Data(repeating: 0, count: 1_000_000))
+        padded.append(flac.dropFirst(42))
+        let server = try await LocalAudioServer([
+            "/aac": [Reply(contentType: "audio/mp4", audio: aac)],
+            "/flac24": [Reply(contentType: "audio/flac", audio: padded)],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = Self.source(id: "kg", qualities: "'flac24bit', 'flac'", platform: "kg") {
+            """
+            if (info.type === 'flac24bit') return '\(server.url("/aac").absoluteString)';
+            if (info.type === 'flac') return '\(server.url("/flac24").absoluteString)';
+            """
+        }
+        let resolver = LXUserAPIService(sourceSnapshot: { (0, [source]) })
+        let reports = TransferReports()
+        let downloads = DownloadManager(directory: directory, findDownload: resolver.findDownload,
+                                        reportTransfer: { reports.append($0) })
+        let track = Self.track(source: "kg")
+        await (try #require(downloads.download(track, quality: .hires))).value
+        let record = try #require(downloads.record(for: track))
+        #expect(record.requestToken == "flac")
+        #expect(record.audio?.bitDepth == 24)
+        #expect(try Data(contentsOf: downloads.fileURL(for: record)) == padded)
+        #expect(server.requestedPaths == ["/aac", "/flac24"])
+        let sizes = reports.values
+        #expect(sizes.map(\.mainBytes) == [4_096, padded.count])
+        #expect(sizes.allSatisfy { $0.rangeRequests == 0 && $0.rangeBytes == 0 })
+        #expect(try Self.stagedFiles(in: directory).isEmpty)
+        print("Prefix metrics: rejected AAC \(sizes.first?.mainBytes ?? -1)/\(aac.count) bytes, GETs 1; successful FLAC \(sizes.last?.mainBytes ?? -1) bytes, GETs 1")
+    }
+
+    enum RangeMode: String, CaseIterable, Sendable {
+        case valid, ignored, wrongRange, changedETag, advertisedShort, truncated
+    }
+
+    @Test("MP4 trailing metadata reads only a validated bounded range",
+          arguments: RangeMode.allCases)
+    func verifiesTrailingMetadata(mode: RangeMode) async throws {
+        let original = try Self.fixture("tone-192", "m4a")
+        let (movie, moovOffset) = try Self.movieWithTrailingMetadata(original)
+        let moov = Data(movie.suffix(from: moovOffset))
+        let etag = "ETag: \"fixture\""
+        let range = "Content-Range: bytes \(moovOffset)-\(movie.count - 1)/\(movie.count)"
+        let full = Reply(headers: [etag], contentType: "audio/mp4", audio: movie)
+        let suffix: Reply
+        switch mode {
+        case .valid:
+            suffix = Reply(status: 206, headers: [etag, range], contentType: "audio/mp4", audio: moov)
+        case .ignored:
+            suffix = full
+        case .wrongRange:
+            suffix = Reply(status: 206, headers: [etag, "Content-Range: bytes 0-42/\(movie.count)"],
+                           contentType: "audio/mp4", audio: moov)
+        case .changedETag:
+            suffix = Reply(status: 206, headers: ["ETag: \"other\"", range], contentType: "audio/mp4", audio: moov)
+        case .advertisedShort:
+            suffix = Reply(status: 206, headers: [etag, range], contentType: "audio/mp4",
+                           audio: Data(moov.dropLast(1)))
+        case .truncated:
+            suffix = Reply(status: 206, length: moov.count, headers: [etag, range], contentType: "audio/mp4",
+                           audio: Data(moov.dropLast(1)))
+        }
+        let flac = try Self.fixture("tone-24", "flac")
+        let server = try await LocalAudioServer([
+            "/movie": [full, suffix],
+            "/unknown-second": [Reply(contentType: "audio/mp4", audio: movie)],
+            "/flac": [Reply(contentType: "audio/flac", audio: flac)],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let report = TransferReports()
+        let session = DownloadStream.makeSession()
+        defer { session.invalidateAndCancel() }
+        let allowance = DownloadUnverifiedAllowance()
+        func fetch(_ path: String) async throws -> URL {
+            try await DownloadStream.fetch(server.url(path), quality: .hires, session: session, stagingDirectory: directory,
+                                           allowance: allowance, progress: { _ in },
+                                           report: { report.append($0) })
+        }
+        if mode == .valid {
+            await #expect(throws: DownloadQualityError.self) { try await fetch("/movie") }
+            #expect(allowance.isAvailable)
+        } else {
+            let temp = try await fetch("/movie")
+            #expect(DownloadAudioQuality.inspect(temp)?.codec == "AAC")
+            await #expect(throws: DownloadError.probeBudget) { try await fetch("/unknown-second") }
+            try FileManager.default.removeItem(at: temp)
+        }
+        let success = try await fetch("/flac")
+        #expect(try Data(contentsOf: success) == flac)
+        let reads = try #require(report.values.first)
+        #expect(reads.rangeRequests == 1)
+        #expect(reads.mainBytes == (mode == .valid ? 4_096 : movie.count))
+        switch mode {
+        case .valid: #expect(reads.rangeBytes == moov.count)
+        case .truncated: #expect(reads.rangeBytes < moov.count)
+        default: #expect(reads.rangeBytes == 0)
+        }
+        let paths = mode == .valid ? ["/movie", "/movie", "/flac"] : ["/movie", "/movie", "/unknown-second", "/flac"]
+        #expect(server.requestedPaths == paths)
+        #expect(server.headers[1].contains("range: bytes=\(moovOffset)-\(movie.count - 1)"))
+        #expect(server.headers[1].contains("if-range: \"fixture\""))
+        if mode != .valid {
+            #expect(report.values[1].mainBytes <= DownloadStream.prefixLimit)
+        }
+        print("Range metrics (\(mode.rawValue)): movie GETs 2, primary \(reads.mainBytes)/\(movie.count) bytes, range \(reads.rangeBytes) bytes; FLAC GETs 1, \(flac.count) bytes")
+    }
+
+    @Test("Redirect policy and full GET length checks apply before final validation")
+    func checksRedirectsShortAndTruncatedBodies() async throws {
+        let flac = try Self.fixture("tone-24", "flac")
+        let server = try await LocalAudioServer([
+            "/redirect": [Reply(status: 302, headers: ["Location: /flac"])],
+            "/denied": [Reply(status: 302, headers: ["Location: /flac", "X-Download-Allowed: no"])],
+            "/no-store": [Reply(status: 302, headers: ["Location: /flac", "Cache-Control: no-store"])],
+            "/unsafe": [Reply(status: 302, headers: ["Location: http://example.invalid/audio"])],
+            "/flac": [Reply(contentType: "audio/flac", audio: flac)],
+            "/short": [Reply(contentType: "audio/flac", audio: Data(flac.prefix(42)))],
+            "/truncated": [Reply(length: flac.count, contentType: "audio/flac", audio: Data(flac.prefix(200)))],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let session = DownloadStream.makeSession()
+        defer { session.invalidateAndCancel() }
+        let report = TransferReports()
+        func fetch(_ path: String) async throws -> URL {
+            try await DownloadStream.fetch(server.url(path), quality: .hires, session: session, stagingDirectory: directory,
+                                           allowance: DownloadUnverifiedAllowance(), progress: { _ in },
+                                           report: { report.append($0) })
+        }
+        #expect(try Data(contentsOf: await fetch("/redirect")) == flac)
+        await #expect(throws: DownloadError.saveProhibited) { try await fetch("/denied") }
+        await #expect(throws: DownloadError.saveProhibited) { try await fetch("/no-store") }
+        await #expect(throws: DownloadError.unsafeURL) { try await fetch("/unsafe") }
+        let shortDownloads = DownloadManager(directory: directory.appendingPathComponent("short")) { _, _ in
+            .init(url: server.url("/short"), quality: "flac24bit")
+        }
+        let track = Self.track()
+        await (try #require(shortDownloads.download(track, quality: .hires))).value
+        #expect(shortDownloads.records.isEmpty)
+        #expect(shortDownloads.failures.count == 1)
+        await #expect(throws: DownloadError.incompleteAudio) { try await fetch("/truncated") }
+        #expect(server.requestedPaths == ["/redirect", "/flac", "/denied", "/no-store", "/unsafe", "/short", "/truncated"])
+        #expect(report.values.map(\.mainBytes).prefix(4) == [flac.count, 0, 0, 0])
+    }
+
+    @Test("ALAC provides depth evidence and MP3 CBR and tail ALAC remain downloadable")
+    func preservesSupportedInconclusiveFormats() async throws {
+        let alac = try Self.fixture("tone-alac", "m4a")
+        let (movie, _) = try Self.movieWithTrailingMetadata(alac)
+        let mp3 = try Self.fixture("tone-mp3-320", "mp3")
+        let alacProbe = DownloadMediaProbe.inspect(Data(alac.prefix(4_096)))
+        #expect(alacProbe.audio?.codec == "ALAC")
+        #expect(alacProbe.audio?.bitDepth == 16)
+        let mp3Probe = DownloadMediaProbe.inspect(Data(mp3.prefix(4_096)))
+        #expect(mp3Probe.audio?.codec == "MP3")
+        #expect(mp3Probe.audio?.bitRate == nil)
+        // Keep the original tag frames and audio while padding ID3 past the prefix.
+        let tagSize = mp3[6..<10].reduce(0) { ($0 << 7) | Int($1) }
+        let paddedSize = 256 * 1024 + tagSize
+        var taggedMP3 = Data(mp3.prefix(6))
+        taggedMP3.append(contentsOf: [21, 14, 7, 0].map { UInt8((paddedSize >> $0) & 0x7f) })
+        taggedMP3.append(mp3[10..<(10 + tagSize)])
+        taggedMP3.append(Data(repeating: 0, count: paddedSize - tagSize))
+        taggedMP3.append(mp3.dropFirst(10 + tagSize))
+        #expect(DownloadMediaProbe.inspect(Data(taggedMP3.prefix(DownloadStream.prefixLimit))).audio == nil)
+        let server = try await LocalAudioServer([
+            "/alac": [Reply(contentType: "audio/mp4", audio: movie)],
+            "/mp3": [Reply(attachment: false, contentType: "application/octet-stream", audio: taggedMP3)],
+        ])
+        defer { server.stop() }
+        for (path, requested, body) in [("/alac", AudioQuality.lossless, movie), ("/mp3", .exhigh, taggedMP3)] {
+            let directory = try Self.temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let downloads = DownloadManager(directory: directory) { _, _ in
+                .init(url: server.url(path), quality: requested.lxType)
+            }
+            let track = Self.track()
+            await (try #require(downloads.download(track, quality: requested))).value
+            let record = try #require(downloads.record(for: track))
+            #expect(try Data(contentsOf: downloads.fileURL(for: record)) == body)
+        }
+    }
+
+    /// Replaces the front moov with equally sized padding, keeping the
+    /// existing absolute sample offsets, then appends it after a larger mdat.
+    private static func movieWithTrailingMetadata(_ original: Data) throws -> (Data, Int) {
+        let ftypEnd = 28
+        let mdat = 4_088
+        let originalMoovSize = original[ftypEnd..<ftypEnd + 4].reduce(0) { ($0 << 8) | Int($1) }
+        #expect(original[ftypEnd + 4..<ftypEnd + 8] == Data("moov".utf8))
+        #expect(original[mdat + 4..<mdat + 8] == Data("mdat".utf8))
+        let metadata = original[ftypEnd..<ftypEnd + originalMoovSize]
+        let padding = 512 * 1024
+        var result = Data(original.prefix(ftypEnd))
+        result.append(boxHeader(size: mdat - ftypEnd, type: "free"))
+        result.append(Data(repeating: 0, count: mdat - ftypEnd - 8))
+        result.append(boxHeader(size: original.count - mdat + padding, type: "mdat"))
+        result.append(original.dropFirst(mdat + 8))
+        result.append(Data(repeating: 0, count: padding))
+        let offset = result.count
+        result.append(metadata)
+        return (result, offset)
+    }
+
+    private static func boxHeader(size: Int, type: String) -> Data {
+        var bigEndian = UInt32(size).bigEndian
+        return withUnsafeBytes(of: &bigEndian) { Data($0) } + Data(type.utf8)
     }
 
     @Test("An authorized inline audio file is saved without attachment")
@@ -699,6 +926,16 @@ private extension DownloadManager {
     }
 }
 
+private final class TransferReports: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reports: [DownloadTransferReport] = []
+    var values: [DownloadTransferReport] { lock.withLock { reports } }
+
+    func append(_ report: DownloadTransferReport) {
+        lock.withLock { reports.append(report) }
+    }
+}
+
 private struct Reply: Sendable {
     var status = 200
     var attachment = true
@@ -722,8 +959,10 @@ private final class LocalAudioServer: @unchecked Sendable {
     // Requests and replies are confined to the listener's serial queue.
     private var replies: [String: [Reply]]
     private var paths: [String] = []
+    private var requestHeaders: [String] = []
 
     var requestedPaths: [String] { queue.sync { paths } }
+    var headers: [String] { queue.sync { requestHeaders } }
 
     init(_ replies: [String: [Reply]]) async throws {
         self.replies = replies
@@ -775,6 +1014,7 @@ private final class LocalAudioServer: @unchecked Sendable {
             }
             let path = text.split(separator: " ").dropFirst().first.map(String.init) ?? ""
             self.paths.append(path)
+            self.requestHeaders.append(text.lowercased())
             let reply = self.replies[path]?.isEmpty == false ? self.replies[path]?.removeFirst() : nil
             connection.send(content: (reply ?? Reply(status: 404)).response, isComplete: true,
                             completion: .contentProcessed { _ in connection.cancel() })
