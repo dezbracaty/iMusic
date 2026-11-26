@@ -6,6 +6,7 @@ struct DownloadCandidate {
     let track: Track
     let sourceID: String?
     var sourceName: String?
+    var requestToken: String?
 }
 
 struct VerifiedDownload {

@@ -300,6 +300,89 @@ struct OfflineDownloadTests {
         #expect(downloads.failures[key] == nil)
     }
 
+    @Test("Hi-Res uses flac only after native routes fail, and saves verified 24-bit audio",
+          arguments: [false, true])
+    func resolvesHiResThroughVerifiedLosslessKey(nativeBackupSucceeds: Bool) async throws {
+        let aac = try Self.fixture("tone-192", "m4a")
+        let flac = try Self.fixture("tone-24", "flac")
+        let good = Reply(attachment: false, contentType: "audio/flac", audio: flac)
+        let server = try await LocalAudioServer([
+            "/native-aac": [Reply(attachment: false, contentType: "audio/mp4", audio: aac)],
+            "/native-backup": [nativeBackupSucceeds ? good : Reply(status: 404)],
+            "/lossless-24": [good],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let preferred = Self.source(id: "preferred", qualities: "'flac24bit', 'flac'", platform: "kg") {
+            """
+            if (info.type === 'flac24bit') return '\(server.url("/native-aac").absoluteString)';
+            if (info.type === 'flac') return '\(server.url("/lossless-24").absoluteString)';
+            throw Error('unexpected tier');
+            """
+        }
+        let backup = Self.source(id: "backup", qualities: "'flac24bit'", platform: "kg") {
+            "if (info.type === 'flac24bit') return '\(server.url("/native-backup").absoluteString)';"
+        }
+        let resolver = LXUserAPIService(sourceSnapshot: { (0, [preferred, backup]) })
+        let downloads = DownloadManager(directory: directory, findDownload: resolver.findDownload,
+                                        selectedSourceID: { "preferred" })
+        let track = Self.track(source: "kg", songmid: "synthetic-live")
+        await (try #require(downloads.download(track, quality: .hires))).value
+        let record = try #require(downloads.record(for: track))
+        #expect(record.quality == "flac24bit")
+        #expect(record.requestToken == (nativeBackupSucceeds ? "flac24bit" : "flac"))
+        #expect(record.sourceID == (nativeBackupSucceeds ? "backup" : "preferred"))
+        #expect(record.sourcePlatform == "kg")
+        #expect(record.qualityVerified == true)
+        #expect(record.qualityLabel == "实际 FLAC 24-bit")
+        #expect(try Data(contentsOf: downloads.fileURL(for: record)) == flac)
+        let nativePaths = ["/native-aac", "/native-backup"]
+        #expect(server.requestedPaths == (nativeBackupSucceeds ? nativePaths : nativePaths + ["/lossless-24"]))
+        #expect(try Self.stagedFiles(in: directory).isEmpty)
+
+        let reopened = DownloadManager(directory: directory, findDownload: resolver.findDownload)
+        #expect(reopened.record(for: track) == record)
+    }
+
+    @Test("Hi-Res rejects 16-bit and lossy alias results and fetches a shared URL once")
+    func refusesLowerQualityThroughLosslessKey() async throws {
+        let aac = try Self.fixture("tone-192", "m4a")
+        let flac16 = try Self.fixture("tone-16", "flac")
+        let flac24 = try Self.fixture("tone-24", "flac")
+        let lossy = Reply(attachment: false, contentType: "audio/mp4", audio: aac)
+        let server = try await LocalAudioServer([
+            "/same-url": [lossy, Reply(contentType: "audio/flac", audio: flac24)],
+            "/alias-flac16": [Reply(contentType: "audio/flac", audio: flac16)],
+            "/alias-aac": [lossy],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sources = [
+            Self.source(id: "shared", qualities: "'flac24bit', 'flac'", platform: "kg") {
+                "return '\(server.url("/same-url").absoluteString)';"
+            },
+            Self.source(id: "16-bit", qualities: "'flac'", platform: "kg") {
+                "if (info.type === 'flac') return '\(server.url("/alias-flac16").absoluteString)';"
+            },
+            Self.source(id: "lossy", qualities: "'flac'", platform: "kg") {
+                "if (info.type === 'flac') return '\(server.url("/alias-aac").absoluteString)';"
+            },
+        ]
+        let resolver = LXUserAPIService(sourceSnapshot: { (0, sources) })
+        let downloads = DownloadManager(directory: directory, findDownload: resolver.findDownload)
+        let track = Self.track(source: "kg")
+        await (try #require(downloads.download(track, quality: .hires))).value
+        let failure = try #require(downloads.failures[DownloadManager.key(for: track)])
+        #expect(failure.requestedQuality == .hires)
+        #expect(failure.message.contains("FLAC 16-bit"))
+        #expect(failure.message.contains("AAC 约 192 kbps"))
+        #expect(downloads.records.isEmpty)
+        #expect(server.requestedPaths == ["/same-url", "/alias-flac16", "/alias-aac"])
+        #expect(try Self.stagedFiles(in: directory).isEmpty)
+    }
+
     @Test("An authorized inline audio file is saved without attachment")
     func acceptsInlineAudio() async throws {
         let audio = try Self.fixture("tone-mp3-320", "mp3")
@@ -638,6 +721,9 @@ private final class LocalAudioServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "imusic.tests.offline-audio")
     // Requests and replies are confined to the listener's serial queue.
     private var replies: [String: [Reply]]
+    private var paths: [String] = []
+
+    var requestedPaths: [String] { queue.sync { paths } }
 
     init(_ replies: [String: [Reply]]) async throws {
         self.replies = replies
@@ -688,6 +774,7 @@ private final class LocalAudioServer: @unchecked Sendable {
                 return
             }
             let path = text.split(separator: " ").dropFirst().first.map(String.init) ?? ""
+            self.paths.append(path)
             let reply = self.replies[path]?.isEmpty == false ? self.replies[path]?.removeFirst() : nil
             connection.send(content: (reply ?? Reply(status: 404)).response, isComplete: true,
                             completion: .contentProcessed { _ in connection.cancel() })

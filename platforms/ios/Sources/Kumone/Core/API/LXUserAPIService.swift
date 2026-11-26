@@ -138,16 +138,20 @@ final class LXUserAPIService: ObservableObject {
         var failures: [DownloadAttemptFailure] = []
         var attemptedURLs = Set<URL>()
 
-        // Try the requested catalogue with every enabled script first, in
-        // selection order. Only then look up the same recording elsewhere.
-        for platforms in [primary.map { [$0] } ?? [], fallbackPlatforms] where !platforms.isEmpty {
+        // Some scripts serve a verified 24-bit file only through "flac".
+        // Exhaust native Hi-Res routes first. The request key can change in
+        // the second pass, but the caller's file verification stays Hi-Res.
+        let requestKeys = quality == .hires ? [quality.lxType, AudioQuality.lossless.lxType] : [quality.lxType]
+        let platformGroups = [primary.map { [$0] } ?? [], fallbackPlatforms].filter { !$0.isEmpty }
+        let passes = requestKeys.flatMap { key in platformGroups.map { (key, $0) } }
+        for (requestKey, platforms) in passes {
             sourceLoop: for source in snapshot.sources {
                 for platform in platforms {
                     try Task.checkCancellation()
                     try validateSourceConfiguration(snapshot.revision, source: source)
                     do {
                         let candidate = try await downloadCandidate(
-                            for: track, on: platform, primary: primary, quality: quality,
+                            for: track, on: platform, primary: primary, requestKey: requestKey,
                             source: source, revision: snapshot.revision, matches: &matches
                         )
                         guard attemptedURLs.insert(candidate.url).inserted else { continue }
@@ -167,7 +171,7 @@ final class LXUserAPIService: ObservableObject {
     }
 
     private func downloadCandidate(
-        for track: Track, on platform: String, primary: String?, quality: AudioQuality,
+        for track: Track, on platform: String, primary: String?, requestKey: String,
         source: LXSourceStore.Source, revision: Int, matches: inout [String: Track?]
     ) async throws -> DownloadCandidate {
         try await acquireSourceOperation()
@@ -178,11 +182,10 @@ final class LXUserAPIService: ObservableObject {
         try validateSourceConfiguration(revision, source: source)
         guard ready else { throw DownloadAttemptFailure.sourceUnavailable }
         guard supports(platform, action: "musicUrl") else { throw DownloadAttemptFailure.noInterface }
-        let requested = quality.lxType
         let declared = Set(qualityCapabilities[platform, default: []].map(Self.normalizedQuality))
         // Catalogue sizes can be missing or incomplete. The script's tier
         // declaration controls the request and the file controls acceptance.
-        guard declared.contains(requested) || (declared.isEmpty && requested == "128k") else {
+        guard declared.contains(requestKey) || (declared.isEmpty && requestKey == "128k") else {
             throw DownloadAttemptFailure.missingQuality
         }
 
@@ -206,13 +209,14 @@ final class LXUserAPIService: ObservableObject {
         guard DownloadManager.permitsDownload(of: selectedTrack) else {
             throw DownloadAttemptFailure.restrictedRecording
         }
-        let qualities = Self.qualityOrder.filter { $0 == requested || declared.contains($0) }
+        let qualities = Self.qualityOrder.filter { $0 == requestKey || declared.contains($0) }
+        let requestToken = protocolQualityToken(requestKey, platform: platform)
         let response: [String: Any]
         do {
             response = try await request(
                 source: platform, action: "musicUrl",
                 info: [
-                    "type": protocolQualityToken(requested, platform: platform),
+                    "type": requestToken,
                     "musicInfo": musicInfo(for: selectedTrack, platform: platform, qualities: qualities),
                 ]
             )
@@ -231,7 +235,8 @@ final class LXUserAPIService: ObservableObject {
               let rawURL = data["url"] as? String, let url = URL(string: rawURL), Self.validHTTPURL(url) else {
             throw DownloadAttemptFailure.noAddress
         }
-        return DownloadCandidate(url: url, track: selectedTrack, sourceID: source.id, sourceName: source.name)
+        return DownloadCandidate(url: url, track: selectedTrack, sourceID: source.id,
+                                 sourceName: source.name, requestToken: requestToken)
     }
 
     /// Load a provider only when a request actually needs one.  A user's

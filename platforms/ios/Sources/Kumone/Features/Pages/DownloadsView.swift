@@ -132,6 +132,7 @@ struct TrackDownloadMenu: View {
         if let record {
             Text(record.qualityLabel)
             if let source = record.sourceLabel { Text("下载来源：\(source)") }
+            if let token = record.requestToken { Text("LX 请求键：\(token)") }
         }
         if let active = downloads.activeDownloads[key] {
             Menu {

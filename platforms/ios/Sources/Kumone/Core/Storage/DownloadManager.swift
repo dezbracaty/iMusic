@@ -19,6 +19,7 @@ final class DownloadManager {
         var preferredSourceID: String?
         var sourceName: String?
         var sourcePlatform: String?
+        var requestToken: String?
         var audio: DownloadAudioQuality?
 
         var sourceLabel: String? {
@@ -195,6 +196,7 @@ final class DownloadManager {
                 item.sourceID = verified.candidate.sourceID
                 item.sourceName = verified.candidate.sourceName
                 item.sourcePlatform = SearchRecordingGroups.source(of: verified.candidate.track)
+                item.requestToken = verified.candidate.requestToken
                 item.audio = verified.audio
                 item.publicFileName = try availableName(for: item)
 

@@ -64,7 +64,7 @@ QQ 音乐和网易云公开歌单会导入为可编辑的本地副本。对这�
 
 音频保存在 **文件 → 我的 iPhone → iMusic → Music**，旧下载在升级后移入此处。若从“文件”删除或移出音频，回到 iMusic 后该下载会从资料库移除。下载索引、音源脚本和账号数据仍保存在应用私有位置。
 
-请只下载你有权保存的音频。iMusic 通过现有 LX 音源解析歌曲所属平台的地址，下载需要允许保存的完整 HTTPS 直链。服务端可以将文件作为附件发送，也可以使用内联响应或省略 `Content-Disposition`。服务端明确禁止保存（例如 `X-Download-Allowed: false`）或要求不存储响应（`Cache-Control: no-store`）时，iMusic 会跳过该候选。下载会核对实际文件。支持核验 MP3/AAC 的 128 与 320 kbps 档位（按文件报告的码率判断，无法确认所有 VBR 文件的编码目标），以及 FLAC、ALAC 和整数 PCM 的 16-bit 或 24-bit 及以上无损档位。单文件上限为 250 MB。应用会显示实际编码、码率或位深。母带、全景声、杜比和环绕声的所选档位目前无法核验。当前档位无法取得可保存的文件时，失败条目会区分音源解析、直链传输和文件核验原因。只有流媒体播放地址的音源仍可用于在线播放。
+请只下载你有权保存的音频。iMusic 通过现有 LX 音源解析歌曲所属平台的地址，下载需要允许保存的完整 HTTPS 直链。服务端可以将文件作为附件发送，也可以使用内联响应或省略 `Content-Disposition`。服务端明确禁止保存（例如 `X-Download-Allowed: false`）或要求不存储响应（`Cache-Control: no-store`）时，iMusic 会跳过该候选。下载会核对实际文件。支持核验 MP3/AAC 的 128 与 320 kbps 档位（按文件报告的码率判断，无法确认所有 VBR 文件的编码目标），以及 FLAC、ALAC 和整数 PCM 的 16-bit 或 24-bit 及以上无损档位。单文件上限为 250 MB。应用会显示实际编码、码率或位深。Hi-Res 会先尝试 LX 的 `flac24bit`，失败后可改用音源声明支持的 `flac` 请求，再按实际 24-bit 或以上无损验收。母带、全景声、杜比和环绕声的所选档位目前无法核验。当前档位无法取得可保存的文件时，失败条目会区分音源解析、直链传输和文件核验原因。只有流媒体播放地址的音源仍可用于在线播放。
 
 ## 构建
 
@@ -76,7 +76,7 @@ xcodegen generate
 xcodebuild -project KumoneIOS.xcodeproj -scheme KumoneIOS -configuration Release -sdk iphoneos CODE_SIGNING_ALLOWED=NO build
 ```
 
-2.1-dev 的系统版本为 `2.1.0`，本地默认构建号为 `213`，未签名 IPA 名为 `imusic_ios_2.1-dev.ipa`。
+2.1-dev 的系统版本为 `2.1.0`，本地默认构建号为 `214`，未签名 IPA 名为 `imusic_ios_2.1-dev.ipa`。
 
 最低部署版本为 iOS 27，适配目标为常规 iPhone 尺寸；当前不提供折叠屏专属布局。
 
