@@ -2079,7 +2079,11 @@ private struct QualityPickerSheet: View {
                     Text("可用音质会随当前平台和音源变化")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                    if let servedQuality = player.servedQuality, !servedQuality.isEmpty {
+                    if let offline = player.offlineQualityLabel {
+                        Label("离线文件 · \(offline)", systemImage: "arrow.down.circle")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else if let servedQuality = player.servedQuality, !servedQuality.isEmpty {
                         Label {
                             Text("实际返回音质：\(AudioQuality(lxType: servedQuality)?.sourceDisplayName ?? servedQuality)。如果音源不支持所选音质，已自动降级。")
                         } icon: {
@@ -3854,6 +3858,7 @@ struct NowPlayingScrubber: View {
     }
 
     private var qualityBadgeText: String {
+        if player.offlineQualityLabel != nil { return "离线" }
         if let served = player.servedQuality {
             return AudioQuality(lxType: served)?.badgeName ?? served.uppercased()
         }
@@ -3864,6 +3869,7 @@ struct NowPlayingScrubber: View {
     }
 
     private var qualityDisplayName: String {
+        if let offline = player.offlineQualityLabel { return "离线文件 · \(offline)" }
         if let served = player.servedQuality {
             return AudioQuality(lxType: served)?.sourceDisplayName ?? served.uppercased()
         }

@@ -8,7 +8,7 @@ struct DownloadsView: View {
 
     var body: some View {
         Group {
-            if let error = downloads.storageError {
+            if let error = downloads.storageError, downloads.records.isEmpty {
                 ContentUnavailableView {
                     Label("无法读取下载", systemImage: "exclamationmark.triangle")
                 } description: {
@@ -28,16 +28,26 @@ struct DownloadsView: View {
             }
         }
         .navigationTitle("已下载")
+        .task { downloads.reload() }
     }
 
     private var downloadList: some View {
         List {
+            if let error = downloads.storageError {
+                Section {
+                    Text(error).foregroundStyle(.secondary)
+                    Button("重新检查文件 App 目录", action: downloads.reload)
+                }
+            }
             if !downloads.activeDownloads.isEmpty {
                 Section("正在下载") {
                     ForEach(downloads.activeDownloads.values.sorted { $0.id < $1.id }) { item in
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(item.track.name)
+                                Text(item.requestedQuality.downloadLabel)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                                 if let fraction = item.fraction {
                                     ProgressView(value: fraction)
                                         .accessibilityLabel("下载进度")
@@ -59,12 +69,15 @@ struct DownloadsView: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(item.track.name)
+                                Text(item.requestedQuality.downloadLabel)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                                 Text(item.message)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Button("重试") { downloads.download(item.track, quality: item.requestedQuality) }
+                            Button("重试") { downloads.retry(item) }
                                 .buttonStyle(.borderless)
                         }
                         .swipeActions {
@@ -74,7 +87,7 @@ struct DownloadsView: View {
                 }
             }
             ForEach(Array(downloads.records.enumerated()), id: \.element.id) { index, record in
-                TrackRow(track: record.track, index: index + 1, style: .compact) {
+                TrackRow(track: record.track, index: index + 1, style: .compact, subtitleDetail: record.qualityLabel) {
                     player.play(tracks: downloads.records.map(\.track), source: .none, startAt: record.track)
                 }
             }
@@ -86,39 +99,83 @@ struct DownloadsView: View {
         .listStyle(.plain)
         .contentMargins(.horizontal, Theme.Layout.contentInset - 16, for: .scrollContent)
         .accessibilityIdentifier("downloadsList")
+        .refreshable { downloads.reload() }
     }
 }
 
 @MainActor
 struct TrackDownloadMenu: View {
     let track: Track
+    var alternatives: [Track] = []
     private let downloads = DownloadManager.shared
+    @ObservedObject private var sources = LXSourceStore.shared
+    @ObservedObject private var settings = SettingsManager.shared
 
     var body: some View {
         let key = DownloadManager.key(for: track)
-        if let record = downloads.record(for: track) {
-            Button(role: .destructive) {
-                downloads.delete(record)
-            } label: {
-                Label("删除离线下载", systemImage: "trash")
-            }
-            .accessibilityIdentifier("removeOfflineDownload")
-        } else if let active = downloads.activeDownloads[key] {
+        let record = downloads.record(for: track)
+        if let record { Text(record.qualityLabel) }
+        if let active = downloads.activeDownloads[key] {
             Menu {
                 Button("取消下载") { downloads.cancel(key) }
             } label: {
                 Label(active.fraction.map { "正在下载 \($0.formatted(.percent))" } ?? "正在准备下载",
                       systemImage: "arrow.down.circle")
             }
-        } else if DownloadManager.permitsDownload(of: track) {
-            Button {
-                downloads.download(track, quality: downloads.failures[key]?.requestedQuality)
-            } label: {
-                Label(downloads.failures[key] == nil ? "下载" : "重试下载",
-                      systemImage: "arrow.down.circle")
+        } else {
+            let candidates = ([track] + alternatives).filter(DownloadManager.permitsDownload)
+            if !candidates.isEmpty {
+                Menu {
+                    if candidates.count == 1, let candidate = candidates.first {
+                        qualityOptions(for: candidate)
+                    } else {
+                        ForEach(candidates, id: \.playbackKey) { candidate in
+                            Menu(platformName(for: candidate)) { qualityOptions(for: candidate) }
+                        }
+                    }
+                } label: {
+                    Label(record != nil && candidates.count == 1 ? "更换下载版本" : "下载", systemImage: "arrow.down.circle")
+                }
+                .accessibilityIdentifier("downloadTrack")
             }
-            .accessibilityIdentifier("downloadTrack")
         }
+        if let record {
+            Button(role: .destructive) {
+                downloads.delete(record)
+            } label: {
+                Label("删除离线下载", systemImage: "trash")
+            }
+            .accessibilityIdentifier("removeOfflineDownload")
+        }
+    }
+
+    @ViewBuilder
+    private func qualityOptions(for candidate: Track) -> some View {
+        Text("\(platformName(for: candidate)) · \(sources.selectedSource?.name ?? "未选择 LX 音源")")
+        let preferred = settings.audioQuality
+        if !preferred.canVerifyDownload {
+            Button("所选音质：\(preferred.downloadLabel)") {
+                downloads.download(candidate, quality: preferred)
+            }
+        }
+        ForEach(AudioQuality.verifiableDownloads) { quality in
+            let installed = downloads.alreadyDownloaded(candidate, quality: quality)
+            Button {
+                downloads.download(candidate, quality: quality)
+            } label: {
+                let name = installed ? "\(quality.downloadLabel) · 已下载" : quality.downloadLabel
+                if quality.lxType == preferred.lxType {
+                    Label(name, systemImage: "checkmark")
+                } else {
+                    Text(name)
+                }
+            }
+            .disabled(installed || downloads.activeDownloads[DownloadManager.key(for: candidate)] != nil)
+        }
+    }
+
+    private func platformName(for track: Track) -> String {
+        LXCatalogPlatform.displayName(for: SearchRecordingGroups.source(of: track))
     }
 }
 

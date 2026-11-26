@@ -8,9 +8,9 @@ import Testing
 struct OfflineDownloadTests {
     @Test("A failed LX download retries once, then plays from disk after reopening and deletes")
     func retryPlayAndDelete() async throws {
-        let audio = Self.wave()
+        let audio = try Self.fixture("tone-128", "m4a")
         let server = try await LocalAudioServer([
-            "/song": [Reply(status: 503), Reply(audio: audio)],
+            "/song": [Reply(status: 503), Reply(contentType: "audio/mp4", audio: audio)],
         ])
         defer { server.stop() }
         let directory = try Self.temporaryDirectory()
@@ -34,7 +34,10 @@ struct OfflineDownloadTests {
         let record = try #require(downloads.record(for: track))
         #expect(downloads.download(track, quality: .standard) == nil)
         #expect(downloads.failures.isEmpty)
-        #expect(record.qualityVerified == false)
+        #expect(record.qualityVerified == true)
+        #expect(record.publicFileName != nil)
+        #expect(record.audio?.codec == "AAC")
+        #expect(downloads.fileURL(for: record).deletingLastPathComponent().lastPathComponent == "Music")
         #expect(record.track.source == "tx")
         #expect(try Data(contentsOf: downloads.fileURL(for: record)) == audio)
         #expect(try Self.stagedFiles(in: directory).isEmpty)
@@ -160,11 +163,16 @@ struct OfflineDownloadTests {
         try manifest.write(to: manifestURL, options: .atomic)
         downloads.reload()
         #expect(downloads.storageError == nil)
-        #expect(downloads.record(for: track)?.qualityVerified == nil)
-        #expect(FileManager.default.fileExists(atPath: file.path))
+        let restored = try #require(downloads.record(for: track))
+        #expect(restored.qualityVerified == nil)
+        #expect(restored.qualityLabel == "实际 PCM 16-bit")
+        #expect(restored.publicFileName != nil)
+        #expect(!FileManager.default.fileExists(atPath: file.path))
+        #expect(try Data(contentsOf: downloads.fileURL(for: restored)) == Self.wave())
         #expect(!FileManager.default.fileExists(atPath: orphan.path))
         #expect(try Self.stagedFiles(in: directory).isEmpty)
-        #expect(try Data(contentsOf: manifestURL) == manifest)
+        let persisted = try JSONDecoder().decode([DownloadManager.Record].self, from: Data(contentsOf: manifestURL))
+        #expect(persisted == [restored])
     }
 
     @Test("Known paid, delisted, copyright-restricted and cloud tracks cannot start transfers")
@@ -209,6 +217,182 @@ struct OfflineDownloadTests {
         let streaming = try await resolver.resolveMusicURL(for: original, quality: AudioQuality.standard.rawValue)
         #expect(streaming.url == url)
         #expect(catalogueMatches == 1)
+    }
+
+    @Test("Downloads preserve the selected LX script and exact quality token")
+    func usesExactScriptAndQuality() async throws {
+        let backupURL = URL(string: "https://backup.example.invalid/tone.flac")!
+        let preferred = Self.source(id: "selected", qualities: "'128k', 'flac24bit'") { """
+            if (info.type === 'flac24bit') return 'https://selected.example.invalid/hires.flac';
+            throw new Error('Unavailable');
+            """ }
+        let backup = Self.source(id: "backup", qualities: "'128k', '320k', 'flac'") { """
+            return '\(backupURL.absoluteString)';
+            """ }
+        let resolver = LXUserAPIService(sourceSnapshot: { (0, [preferred, backup]) },
+                                        platformFallbackEnabled: { false })
+        let track = Self.track()
+        await #expect(throws: DownloadQualityError.self) {
+            try await resolver.resolveDownloadMusicURL(for: track, quality: AudioQuality.lossless.rawValue)
+        }
+        await #expect(throws: LXUserAPIService.LXError.self) {
+            try await resolver.resolveDownloadMusicURL(for: track, quality: AudioQuality.standard.rawValue)
+        }
+        let exact = try await resolver.resolveDownloadMusicURL(for: track, quality: AudioQuality.hires.rawValue)
+        #expect(exact.quality == "flac24bit")
+        #expect(exact.url.host == "selected.example.invalid")
+        #expect(exact.qualityIsVerified == false)
+        let streaming = try await resolver.resolveMusicURL(for: track, quality: AudioQuality.standard.rawValue)
+        #expect(streaming.url == backupURL)
+    }
+
+    @Test("Downloaded audio is measured in both AAC tiers and FLAC bit depths")
+    func measuresAudioTiers() throws {
+        let formats: [(String, String, AudioQuality, AudioQuality)] = [
+            ("tone-128", "m4a", .standard, .exhigh),
+            ("tone-320", "m4a", .exhigh, .standard),
+            ("tone-16", "flac", .lossless, .hires),
+            ("tone-24", "flac", .hires, .lossless),
+        ]
+        for (name, ext, exact, mismatch) in formats {
+            let audio = try #require(DownloadAudioQuality.inspect(Self.fixtureURL(name, ext)))
+            #expect(audio.matches(exact))
+            #expect(!audio.matches(mismatch))
+        }
+    }
+
+    @Test("An incorrect replacement leaves the old copy, and a verified alternative replaces it")
+    func verifiesReplacementBeforeCommit() async throws {
+        let originalAudio = try Self.fixture("tone-128", "m4a")
+        let replacementAudio = try Self.fixture("tone-16", "flac")
+        let server = try await LocalAudioServer([
+            "/standard": [Reply(contentType: "audio/mp4", audio: originalAudio)],
+            "/lossless": [Reply(contentType: "audio/mp4", audio: originalAudio),
+                          Reply(contentType: "audio/flac", audio: replacementAudio)],
+        ])
+        defer { server.stop() }
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var sourceID = "selected"
+        var requests = 0
+        let downloads = DownloadManager(directory: directory, resolve: { _, quality in
+            requests += 1
+            return .init(url: server.url("/" + quality), quality: AudioQuality(rawValue: quality)!.lxType)
+        }, selectedSourceID: { sourceID })
+        let track = Self.track()
+        let key = DownloadManager.key(for: track)
+        await (try #require(downloads.download(track, quality: .standard))).value
+        let original = try #require(downloads.record(for: track))
+        let originalURL = downloads.fileURL(for: original)
+        #expect(downloads.download(track, quality: .standard) == nil)
+
+        await (try #require(downloads.download(track, quality: .lossless))).value
+        let failure = try #require(downloads.failures[key])
+        #expect(failure.message.contains("音质不符"))
+        #expect(downloads.record(for: track) == original)
+        #expect(try Data(contentsOf: originalURL) == originalAudio)
+        #expect(try Self.stagedFiles(in: directory).isEmpty)
+
+        sourceID = "different-script"
+        downloads.retry(failure)
+        #expect(downloads.activeDownloads.isEmpty)
+        #expect(requests == 2)
+        #expect(!downloads.alreadyDownloaded(track, quality: .standard))
+        await (try #require(downloads.download(track, quality: .lossless))).value
+        let replacement = try #require(downloads.record(for: track))
+        #expect(replacement.sourceID == "different-script")
+        #expect(replacement.qualityLabel == "实际 FLAC 16-bit")
+        #expect(try Data(contentsOf: downloads.fileURL(for: replacement)) == replacementAudio)
+        #expect(!FileManager.default.fileExists(atPath: originalURL.path))
+        #expect(downloads.records.count == 1)
+    }
+
+    @Test("A destination conflict keeps the external file and deletion in Files removes the library entry")
+    func externalDeletionAndMigrationConflict() throws {
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let storage = directory.appendingPathComponent("Downloads")
+        let music = directory.appendingPathComponent("Documents/Music")
+        for folder in [storage, music] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        let track = Self.track()
+        var pending = DownloadManager.Record(id: track.playbackKey, track: track, quality: "128k",
+                                             qualityVerified: false, fileName: "legacy.wav", createdAt: Date())
+        pending.publicFileName = "claimed.wav"
+        try JSONEncoder().encode([pending]).write(to: directory.appendingPathComponent("downloads.json"))
+        try Self.wave().write(to: storage.appendingPathComponent(pending.fileName))
+        let external = music.appendingPathComponent("claimed.wav")
+        let externalBytes = Data("external file".utf8)
+        try externalBytes.write(to: external)
+
+        let downloads = DownloadManager(directory: directory, musicDirectory: music) { _, _ in throw URLError(.badURL) }
+        let record = try #require(downloads.record(for: track))
+        let file = downloads.fileURL(for: record)
+        #expect(file != external)
+        #expect(file.deletingLastPathComponent().path == music.path)
+        #expect(try Data(contentsOf: external) == externalBytes)
+        #expect(try Data(contentsOf: file) == Self.wave())
+        try FileManager.default.removeItem(at: file)
+        #expect(downloads.record(for: track) == nil)
+        downloads.reload()
+        #expect(downloads.records.isEmpty)
+        #expect(try Data(contentsOf: external) == externalBytes)
+    }
+
+    @Test("Migration leaves unrecognized legacy bytes private, and interrupted public deletion rolls back")
+    func recoversPublicDeletionWithoutExportingUnknownFiles() throws {
+        let directory = try Self.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let storage = directory.appendingPathComponent("Downloads")
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        let track = Self.track()
+        let questionable = Self.track(source: "wy")
+        let old = DownloadManager.Record(id: track.playbackKey, track: track, quality: "128k",
+                                         qualityVerified: false, fileName: "legacy.wav", createdAt: Date())
+        let unknown = DownloadManager.Record(id: questionable.playbackKey, track: questionable, quality: "128k",
+                                             qualityVerified: nil, fileName: "unrecognized.m4a", createdAt: Date())
+        let manifest = directory.appendingPathComponent("downloads.json")
+        try JSONEncoder().encode([old, unknown]).write(to: manifest)
+        try Self.wave().write(to: storage.appendingPathComponent(old.fileName))
+        try Data("unexpected legacy data".utf8).write(to: storage.appendingPathComponent(unknown.fileName))
+        let store = DownloadManager(directory: directory) { _, _ in throw URLError(.badURL) }
+        let migrated = try #require(store.record(for: track))
+        let file = store.fileURL(for: migrated)
+        let privateCopy = try #require(store.record(for: questionable))
+        #expect(privateCopy.publicFileName == nil)
+        #expect(privateCopy.qualityLabel.contains("实际音质未知"))
+        #expect(store.fileURL(for: privateCopy).deletingLastPathComponent().path == storage.path)
+        let exposed = try FileManager.default.contentsOfDirectory(atPath: file.deletingLastPathComponent().path)
+        #expect(exposed == [file.lastPathComponent])
+
+        let trash = storage.appendingPathComponent(".staging/removed-from-music-" + migrated.fileName)
+        try FileManager.default.moveItem(at: file, to: trash)
+        store.reload()
+        #expect(store.record(for: track) == migrated)
+        #expect(try Data(contentsOf: file) == Self.wave())
+        #expect(try Self.stagedFiles(in: directory).isEmpty)
+    }
+
+    private static func fixtureURL(_ name: String, _ ext: String) throws -> URL {
+        try #require(Bundle.module.url(forResource: name, withExtension: ext, subdirectory: "AudioFixtures"))
+    }
+
+    private static func fixture(_ name: String, _ ext: String) throws -> Data {
+        try Data(contentsOf: fixtureURL(name, ext))
+    }
+
+    private static func source(id: String, qualities: String, body: () -> String) -> LXSourceStore.Source {
+        LXSourceStore.Source(
+            id: id, name: id, description: "Synthetic test audio", version: "1.0.0",
+            author: "iMusic tests", homepage: "", script: """
+                lx.on(lx.EVENT_NAMES.request, async ({ info }) => { \(body()) })
+                lx.send(lx.EVENT_NAMES.inited, {
+                    status: true, sources: { tx: { type: 'music', actions: ['musicUrl'], qualitys: [\(qualities)] } }
+                })
+                """, sourceURL: nil
+        )
     }
 
     private static func resolver(url: URL, match: (@MainActor (Track, String) async -> Track?)? = nil) -> LXUserAPIService {
@@ -275,10 +459,11 @@ private struct Reply: Sendable {
     var attachment = true
     var length: Int?
     var headers: [String] = []
+    var contentType = "audio/wav"
     var audio = Data()
 
     var response: Data {
-        var lines = ["HTTP/1.1 \(status) Test", "Content-Type: audio/wav", "Connection: close",
+        var lines = ["HTTP/1.1 \(status) Test", "Content-Type: \(contentType)", "Connection: close",
                      "Content-Length: \(length ?? audio.count)"] + headers
         if attachment { lines.append("Content-Disposition: attachment; filename=fixture.wav") }
         return Data((lines.joined(separator: "\r\n") + "\r\n\r\n").utf8) + audio

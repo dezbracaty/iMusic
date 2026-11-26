@@ -25,6 +25,7 @@ struct TrackRow: View {
     var showsSeparator = false
     var sourceAlternatives: [Track] = []
     var onPlayFromSource: ((Track) -> Void)?
+    var subtitleDetail: String?
     let onPlay: () -> Void
 
     @EnvironmentObject private var player: PlayerService
@@ -97,7 +98,7 @@ struct TrackRow: View {
                 }
                 // Two lines like the system song row. Source and quality live
                 // in the player and the row menu, not under every song.
-                Text(track.artistNames)
+                Text(subtitleDetail.map { "\(track.artistNames) · \($0)" } ?? track.artistNames)
                     .font(isCompact ? Font.subheadline : Font.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -328,7 +329,7 @@ struct TrackRow: View {
             showAddToPlaylist = true
         }
         #if os(iOS)
-        TrackDownloadMenu(track: track)
+        TrackDownloadMenu(track: track, alternatives: sourceAlternatives)
         #endif
         if onRemoved != nil {
             Button("从本地歌单中删除", role: .destructive) {

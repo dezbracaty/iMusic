@@ -14,6 +14,15 @@ final class DownloadManager {
         let qualityVerified: Bool?
         let fileName: String
         let createdAt: Date
+        var publicFileName: String?
+        var sourceID: String?
+        var audio: DownloadAudioQuality?
+
+        var qualityLabel: String {
+            if let audio { return "实际 \(audio.label)" }
+            let tier = AudioQuality(lxType: quality)?.downloadLabel ?? quality
+            return qualityVerified == true ? "已确认 \(tier)" : "旧版请求 \(tier) · 实际音质未知"
+        }
     }
 
     struct ActiveDownload: Identifiable {
@@ -27,14 +36,17 @@ final class DownloadManager {
         let id: String
         let track: Track
         let requestedQuality: AudioQuality
+        let sourceID: String?
         let message: String
     }
 
     static let shared = DownloadManager(
         directory: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Moumusic", isDirectory: true),
+        musicDirectory: URL.documentsDirectory.appendingPathComponent("Music", isDirectory: true),
         resolve: { try await LXUserAPIService.shared.resolveDownloadMusicURL(for: $0, quality: $1) },
         sourceRevision: { LXSourceStore.shared.configurationRevision },
+        selectedSourceID: { LXSourceStore.shared.selectedID },
         notify: { ToastCenter.shared.show($0) }
     )
     private static let logger = Logger(subsystem: "com.jiajia2222.imusic.ios", category: "Downloads")
@@ -49,11 +61,14 @@ final class DownloadManager {
     @ObservationIgnored private var session: URLSession?
     private let resolve: @MainActor (Track, String) async throws -> LXUserAPIService.ResolvedURL
     private let sourceRevision: @MainActor () -> Int
+    private let selectedSourceID: @MainActor () -> String?
+    @ObservationIgnored private var needsReload = false
     private let notify: @MainActor (String) -> Void
 
     private let manifestURL: URL
     private let downloadDirectory: URL
     private let stagingDirectory: URL
+    private let musicDirectory: URL
 
     private struct Transfer {
         let key: String
@@ -62,12 +77,16 @@ final class DownloadManager {
     }
 
     init(directory: URL,
+         musicDirectory: URL? = nil,
          resolve: @escaping @MainActor (Track, String) async throws -> LXUserAPIService.ResolvedURL,
          sourceRevision: @escaping @MainActor () -> Int = { 0 },
+         selectedSourceID: @escaping @MainActor () -> String? = { nil },
          notify: @escaping @MainActor (String) -> Void = { _ in }) {
         self.resolve = resolve
         self.sourceRevision = sourceRevision
+        self.selectedSourceID = selectedSourceID
         self.notify = notify
+        self.musicDirectory = musicDirectory ?? directory.appendingPathComponent("Documents/Music", isDirectory: true)
         manifestURL = directory.appendingPathComponent("downloads.json")
         downloadDirectory = directory.appendingPathComponent("Downloads", isDirectory: true)
         stagingDirectory = downloadDirectory.appendingPathComponent(".staging", isDirectory: true)
@@ -88,13 +107,26 @@ final class DownloadManager {
 
     func record(for track: Track) -> Record? {
         let key = Self.key(for: track)
-        guard let record = records.first(where: { $0.id == key }),
-              FileManager.default.fileExists(atPath: fileURL(for: record).path) else { return nil }
-        return record
+        return records.first { $0.id == key && (try? existingFile(for: $0)) != nil }
     }
 
     func fileURL(for record: Record) -> URL {
-        downloadDirectory.appendingPathComponent(record.fileName)
+        (try? existingFile(for: record)) ?? privateFile(for: record)
+    }
+
+    func alreadyDownloaded(_ track: Track, quality: AudioQuality) -> Bool {
+        guard let record = record(for: track) else { return false }
+        if record.sourceID == nil && selectedSourceID() != nil { return false }
+        return record.sourceID == selectedSourceID()
+            && record.quality == quality.lxType && record.qualityVerified == true
+    }
+
+    func retry(_ failure: Failure) {
+        guard selectedSourceID() == failure.sourceID else {
+            notify("请切回上次选择的 LX 音源后重试，或重新选择下载")
+            return
+        }
+        download(failure.track, quality: failure.requestedQuality)
     }
 
     static func localAsset(at url: URL) -> AVURLAsset {
@@ -107,7 +139,7 @@ final class DownloadManager {
     func download(_ track: Track, quality: AudioQuality? = nil) -> Task<Void, Never>? {
         let track = track.normalizedForLXPlayback()
         let key = track.playbackKey
-        guard tasks[key] == nil, record(for: track) == nil else { return nil }
+        guard tasks[key] == nil else { return nil }
         guard Self.permitsDownload(of: track) else {
             notify(DownloadError.restricted.localizedDescription)
             return nil
@@ -118,7 +150,13 @@ final class DownloadManager {
         }
 
         let requestedQuality = quality ?? SettingsManager.shared.audioQuality
+        guard !alreadyDownloaded(track, quality: requestedQuality) else { return nil }
+        guard requestedQuality.canVerifyDownload else {
+            notify(DownloadQualityError.unsupportedVerification.localizedDescription)
+            return nil
+        }
         let revision = sourceRevision()
+        let sourceID = selectedSourceID()
         failures[key] = nil
         activeDownloads[key] = ActiveDownload(id: key, track: track, requestedQuality: requestedQuality)
         notify("正在下载《\(track.name)》")
@@ -126,6 +164,7 @@ final class DownloadManager {
             defer {
                 activeDownloads[key] = nil
                 tasks[key] = nil
+                if tasks.isEmpty, needsReload { reload() }
             }
             do {
                 try Task.checkCancellation()
@@ -133,29 +172,36 @@ final class DownloadManager {
                 let resolved = try await resolve(track, requestedQuality.rawValue)
                 try Task.checkCancellation()
                 guard sourceRevision() == revision else { throw DownloadError.sourceChanged }
+                guard resolved.quality == requestedQuality.lxType else { throw DownloadQualityError.unavailable }
                 let staged = try await transfer(from: resolved.url, key: key)
                 defer { try? FileManager.default.removeItem(at: staged) }
                 try await Self.validateAudio(at: staged, expectedDuration: track.duration)
                 try Task.checkCancellation()
                 guard sourceRevision() == revision else { throw DownloadError.sourceChanged }
 
-                let fileName = "offline-\(UUID().uuidString).\(staged.pathExtension)"
-                let item = Record(id: key, track: track, quality: resolved.quality,
-                                  qualityVerified: resolved.qualityIsVerified,
-                                  fileName: fileName, createdAt: Date())
-                let destination = fileURL(for: item)
-                try FileManager.default.moveItem(at: staged, to: destination)
-                do {
-                    try save([item] + records.filter { $0.id != key })
-                } catch {
-                    try? FileManager.default.removeItem(at: destination)
-                    throw error
+                let audio = DownloadAudioQuality.inspect(staged)
+                guard let audio, audio.matches(requestedQuality) else {
+                    throw DownloadQualityError.mismatch(audio?.label)
                 }
-                notify("已下载《\(track.name)》")
+                let fileName = "offline-\(UUID().uuidString).\(staged.pathExtension)"
+                var item = Record(id: key, track: track, quality: requestedQuality.lxType,
+                                  qualityVerified: true, fileName: fileName, createdAt: Date())
+                item.sourceID = sourceID
+                item.audio = audio
+                item.publicFileName = try availableName(for: item)
+
+                try install(item, from: staged)
+                relocatePrivateFiles()
+                if storageError == nil {
+                    notify("已下载《\(track.name)》")
+                } else {
+                    notify("已保存在应用内，暂时无法移至文件 App")
+                }
             } catch {
                 guard !Task.isCancelled else { return }
                 let message = Self.message(for: error)
-                failures[key] = Failure(id: key, track: track, requestedQuality: requestedQuality, message: message)
+                failures[key] = Failure(id: key, track: track, requestedQuality: requestedQuality,
+                                        sourceID: sourceID, message: message)
                 notify("《\(track.name)》下载失败：\(message)")
             }
         }
@@ -168,24 +214,9 @@ final class DownloadManager {
     func dismissFailure(_ id: String) { failures[id] = nil }
 
     func delete(_ record: Record) {
-        // A menu may still refer to a record that was deleted and replaced.
         guard records.contains(where: { $0.id == record.id && $0.fileName == record.fileName }) else { return }
-        let file = fileURL(for: record)
-        let staged = stagedDeletion(for: record)
-        let manager = FileManager.default
         do {
-            if manager.fileExists(atPath: file.path) {
-                try manager.moveItem(at: file, to: staged)
-            }
-            do {
-                try save(records.filter { $0.id != record.id })
-            } catch {
-                if manager.fileExists(atPath: staged.path) {
-                    try manager.moveItem(at: staged, to: file)
-                }
-                throw error
-            }
-            try manager.removeItemIfPresent(at: staged)
+            try commit(records.filter { $0.id != record.id }, replacing: record)
             notify("已删除离线下载")
         } catch {
             Self.logger.error("Download removal failed: \(error.localizedDescription, privacy: .private)")
@@ -194,7 +225,11 @@ final class DownloadManager {
     }
 
     func reload() {
-        guard tasks.isEmpty else { return }
+        guard tasks.isEmpty else {
+            needsReload = true
+            return
+        }
+        needsReload = false
         let manager = FileManager.default
         do {
             try manager.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
@@ -204,22 +239,19 @@ final class DownloadManager {
             } catch CocoaError.fileReadNoSuchFile {
                 stored = []
             }
+            // Recover interrupted removals before checking for files deleted
+            // in Files. Only the app's private directory is swept.
             var ids = Set<String>()
             var visible: [Record] = []
             for record in stored {
-                guard Self.isLocalName(record.fileName) else { continue }
-                let file = fileURL(for: record)
-                let staged = stagedDeletion(for: record)
-                if manager.fileExists(atPath: staged.path), !manager.fileExists(atPath: file.path) {
-                    try manager.moveItem(at: staged, to: file)
-                }
-                if manager.fileExists(atPath: file.path), ids.insert(record.id).inserted {
-                    visible.append(record)
-                }
+                guard Self.isLocalName(record.fileName), ids.insert(record.id).inserted else { continue }
+                try restoreDeletion(for: record, publicCopy: false)
+                try restoreDeletion(for: record, publicCopy: true)
+                if try existingFile(for: record) != nil { visible.append(record) }
             }
-            // A crash before the atomic manifest write can leave a new final
-            // file unreferenced. Legacy filenames are kept and never swept.
-            let storedNames = Set(stored.map(\.fileName))
+            if visible != stored { try save(visible) }
+            else { records = visible }
+            let storedNames = Set(visible.map(\.fileName))
             for url in try manager.contentsOfDirectory(at: downloadDirectory, includingPropertiesForKeys: nil)
                 where Self.isManagedFile(url) && !storedNames.contains(url.lastPathComponent) {
                 try manager.removeItem(at: url)
@@ -227,12 +259,128 @@ final class DownloadManager {
             for url in try manager.contentsOfDirectory(at: stagingDirectory, includingPropertiesForKeys: nil) {
                 try manager.removeItem(at: url)
             }
-            records = visible
+            relocatePrivateFiles()
+        } catch {
+            reportStorageError(error)
+        }
+    }
+
+    private func install(_ record: Record, from staged: URL) throws {
+        let manager = FileManager.default
+        let ready = privateFile(for: record)
+        try manager.moveItem(at: staged, to: ready)
+        do {
+            try commit([record] + records.filter { $0.id != record.id },
+                       replacing: records.first { $0.id == record.id })
+        } catch {
+            try? manager.removeItem(at: ready)
+            throw error
+        }
+    }
+
+    private func commit(_ next: [Record], replacing record: Record?) throws {
+        let manager = FileManager.default
+        guard let record, let old = try existingFile(for: record) else {
+            try save(next)
+            return
+        }
+        let staged = stagedDeletion(for: record, publicCopy: old == publicFile(for: record))
+        try manager.moveItem(at: old, to: staged)
+        do {
+            try save(next)
+        } catch {
+            try manager.moveItem(at: staged, to: old)
+            throw error
+        }
+        // A crash after committing the manifest leaves private trash, which
+        // reload safely removes because the old fileName is unreferenced.
+        try? manager.removeItem(at: staged)
+    }
+
+    private func relocatePrivateFiles() {
+        do {
+            try prepareMusicDirectory()
+            var pending = records
+            var moves: [(from: URL, to: URL)] = []
+            for index in pending.indices {
+                let source = privateFile(for: pending[index])
+                guard try Self.isRegularFile(source),
+                      try Self.hasAudioFileHeader(at: source) else { continue }
+                if pending[index].audio == nil { pending[index].audio = DownloadAudioQuality.inspect(source) }
+                if let target = publicFile(for: pending[index]), try !Self.itemExists(target) {
+                    moves.append((source, target))
+                } else {
+                    let name = try availableName(for: pending[index])
+                    pending[index].publicFileName = name
+                    moves.append((source, musicDirectory.appendingPathComponent(name)))
+                }
+            }
+            // Reserve the destination in the private manifest first. If
+            // interrupted, the complete private copy stays playable and
+            // reload can retry the same move without creating a second copy.
+            if pending != records { try save(pending) }
+            for move in moves { try FileManager.default.moveItem(at: move.from, to: move.to) }
             storageError = nil
         } catch {
-            Self.logger.error("Download library load failed: \(error.localizedDescription, privacy: .private)")
-            storageError = DownloadError.storage.localizedDescription
+            reportStorageError(error)
         }
+    }
+
+    private func prepareMusicDirectory() throws {
+        try FileManager.default.createDirectory(at: musicDirectory, withIntermediateDirectories: true)
+        let values = try musicDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else { throw DownloadError.storage }
+    }
+
+    private func availableName(for record: Record) throws -> String {
+        let invalid = CharacterSet(charactersIn: "/\\:").union(.controlCharacters)
+        let title = record.track.name.components(separatedBy: invalid).joined(separator: " ")
+            .trimmingCharacters(in: CharacterSet(charactersIn: ". ").union(.whitespacesAndNewlines))
+        let stem = title.isEmpty ? "Music" : String(decoding: title.utf8.prefix(144), as: UTF8.self)
+        let ext = (record.fileName as NSString).pathExtension.lowercased()
+        while true {
+            let name = "\(stem) [\(UUID().uuidString.prefix(12))].\(ext)"
+            if try !Self.itemExists(musicDirectory.appendingPathComponent(name)) { return name }
+        }
+    }
+
+    private func existingFile(for record: Record) throws -> URL? {
+        let privateURL = privateFile(for: record)
+        if try Self.isRegularFile(privateURL) { return privateURL }
+        guard let publicURL = publicFile(for: record) else { return nil }
+        guard try Self.itemExists(musicDirectory) else { return nil }
+        let values = try musicDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else { throw DownloadError.storage }
+        return try Self.isRegularFile(publicURL) ? publicURL : nil
+    }
+
+    private func privateFile(for record: Record) -> URL {
+        downloadDirectory.appendingPathComponent(record.fileName)
+    }
+
+    private func publicFile(for record: Record) -> URL? {
+        guard let name = record.publicFileName, Self.isLocalName(name) else { return nil }
+        return musicDirectory.appendingPathComponent(name)
+    }
+
+    private func restoreDeletion(for record: Record, publicCopy: Bool) throws {
+        let staged = stagedDeletion(for: record, publicCopy: publicCopy)
+        guard try Self.isRegularFile(staged) else { return }
+        let destination: URL
+        if publicCopy {
+            guard let publicURL = publicFile(for: record) else { throw DownloadError.storage }
+            try prepareMusicDirectory()
+            destination = publicURL
+        } else {
+            destination = privateFile(for: record)
+        }
+        // Preserve both files if the original name was claimed externally.
+        try FileManager.default.moveItem(at: staged, to: destination)
+    }
+
+    private func stagedDeletion(for record: Record, publicCopy: Bool) -> URL {
+        let prefix = publicCopy ? "removed-from-music-" : "deleted-"
+        return stagingDirectory.appendingPathComponent(prefix + record.fileName)
     }
 
     private func save(_ next: [Record]) throws {
@@ -240,12 +388,33 @@ final class DownloadManager {
         records = next
     }
 
-    private func stagedDeletion(for record: Record) -> URL {
-        stagingDirectory.appendingPathComponent("deleted-\(record.fileName)")
+    private func reportStorageError(_ error: Error) {
+        Self.logger.error("Download library storage failed: \(error.localizedDescription, privacy: .private)")
+        storageError = DownloadError.storage.localizedDescription
     }
 
     private static func isLocalName(_ name: String) -> Bool {
-        !name.isEmpty && name != "." && name != ".." && !name.contains("/")
+        !name.isEmpty && name != "." && name != ".."
+            && name.rangeOfCharacter(from: CharacterSet(charactersIn: "/\\:\0")) == nil
+    }
+
+    private static func itemExists(_ url: URL) throws -> Bool {
+        try fileValues(url) != nil
+    }
+
+    private static func isRegularFile(_ url: URL) throws -> Bool {
+        guard let values = try fileValues(url) else { return false }
+        return values.isRegularFile == true && values.isSymbolicLink != true
+    }
+
+    private static func fileValues(_ url: URL) throws -> URLResourceValues? {
+        do {
+            return try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        } catch CocoaError.fileReadNoSuchFile {
+            return nil
+        } catch CocoaError.fileNoSuchFile {
+            return nil
+        }
     }
 
     private static func isManagedFile(_ url: URL) -> Bool {
@@ -256,6 +425,7 @@ final class DownloadManager {
 
     private static func message(for error: Error) -> String {
         if let error = error as? DownloadError { return error.localizedDescription }
+        if let error = error as? DownloadQualityError { return error.localizedDescription }
         if error is LXUserAPIService.LXError || error is LXCatalogError {
             return PlaybackFailureMessage.source(error)
         }
@@ -297,13 +467,14 @@ final class DownloadManager {
         func matches(_ text: String, at offset: Int = 0) -> Bool {
             header.dropFirst(offset).starts(with: text.utf8)
         }
-        switch url.pathExtension {
+        switch url.pathExtension.lowercased() {
         case "wav": return (matches("RIFF") || matches("RF64")) && matches("WAVE", at: 8)
         case "aif", "aiff": return matches("FORM") && (matches("AIFF", at: 8) || matches("AIFC", at: 8))
         case "caf": return matches("caff")
         case "flac": return matches("fLaC") || matches("ID3")
         case "m4a": return matches("ftyp", at: 4)
         case "aac", "mp3": return matches("ID3") || (header[0] == 0xff && header[1] & 0xe0 == 0xe0)
+        case "ogg", "opus": return matches("OggS")
         default: return false
         }
     }
@@ -350,13 +521,6 @@ final class DownloadManager {
         }
         if case .failure = result { transfer.task.cancel() }
         transfer.continuation.resume(with: result)
-    }
-}
-
-private extension FileManager {
-    func removeItemIfPresent(at url: URL) throws {
-        do { try removeItem(at: url) }
-        catch CocoaError.fileNoSuchFile {}
     }
 }
 

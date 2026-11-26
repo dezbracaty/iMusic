@@ -27,7 +27,8 @@ let package = Package(
             dependencies: [
                 "KumoneIOSFeature",
                 .product(name: "KumoneCore", package: "ios"),
-            ]
+            ],
+            resources: [.copy("AudioFixtures")]
         ),
     ]
 )

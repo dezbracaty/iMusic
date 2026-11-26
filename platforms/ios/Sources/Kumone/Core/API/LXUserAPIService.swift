@@ -117,7 +117,46 @@ final class LXUserAPIService: ObservableObject {
 
     func resolveDownloadMusicURL(for track: Track, quality: String) async throws -> ResolvedURL {
         let resolver = self === Self.shared ? Self.downloadResolver : self
-        return try await resolver.resolveMusicURL(for: track, quality: quality, forDownload: true)
+        return try await resolver.resolveExactDownload(for: track, quality: quality)
+    }
+
+    private func resolveExactDownload(for track: Track, quality: String) async throws -> ResolvedURL {
+        try await acquireSourceOperation()
+        defer { releaseSourceOperation() }
+        try Task.checkCancellation()
+        guard let platform = primaryPlatform(for: track) else { throw LXCatalogError.unsupported }
+        let snapshot = sourceSnapshot()
+        // The selected LX script is first in the live snapshot. Backups are
+        // for streaming and must not fulfill an explicit offline request.
+        guard let source = snapshot.sources.first else { throw LXError.noSource }
+        guard await activate(source) else {
+            try Task.checkCancellation()
+            try validateSourceConfiguration(snapshot.revision, source: source)
+            throw LXError.sourceUnavailable(statusMessage)
+        }
+        try Task.checkCancellation()
+        try validateSourceConfiguration(snapshot.revision, source: source)
+        guard supports(platform, action: "musicUrl") else {
+            throw LXError.missingCapability(platform, "musicUrl")
+        }
+        let supported = supportedQualityNames(for: track, platform: platform)
+        guard let requested = AudioQuality(rawValue: quality)?.lxType, supported.contains(requested) else {
+            throw DownloadQualityError.unavailable
+        }
+        let response = try await request(
+            source: platform, action: "musicUrl",
+            info: [
+                "type": protocolQualityToken(requested, platform: platform),
+                "musicInfo": musicInfo(for: track, platform: platform, qualities: supported),
+            ]
+        )
+        try Task.checkCancellation()
+        try validateSourceConfiguration(snapshot.revision, source: source)
+        guard let data = response["data"] as? [String: Any],
+              let rawURL = data["url"] as? String, let url = URL(string: rawURL), Self.validHTTPURL(url) else {
+            throw DownloadQualityError.unavailable
+        }
+        return ResolvedURL(url: url, quality: requested, qualityIsVerified: false)
     }
 
     /// Load a provider only when a request actually needs one.  A user's
@@ -186,20 +225,15 @@ final class LXUserAPIService: ObservableObject {
     }
 
     func resolveMusicURL(for track: Track, quality: String) async throws -> ResolvedURL {
-        try await resolveMusicURL(for: track, quality: quality, forDownload: false)
-    }
-
-    private func resolveMusicURL(for track: Track, quality: String, forDownload: Bool) async throws -> ResolvedURL {
         try await acquireSourceOperation()
         defer { releaseSourceOperation() }
         try Task.checkCancellation()
-        return try await resolveMusicURLAcrossSources(for: track, quality: quality, forDownload: forDownload)
+        return try await resolveMusicURLAcrossSources(for: track, quality: quality)
     }
 
-    private func resolveMusicURLAcrossSources(for track: Track, quality: String,
-                                              forDownload: Bool) async throws -> ResolvedURL {
+    private func resolveMusicURLAcrossSources(for track: Track, quality: String) async throws -> ResolvedURL {
         let primaryPlatform = self.primaryPlatform(for: track)
-        let fallbackEnabled = !forDownload && platformFallbackEnabled()
+        let fallbackEnabled = platformFallbackEnabled()
         guard primaryPlatform != nil || fallbackEnabled else { throw LXCatalogError.unsupported }
         let snapshot = sourceSnapshot()
         let sourceRevision = snapshot.revision

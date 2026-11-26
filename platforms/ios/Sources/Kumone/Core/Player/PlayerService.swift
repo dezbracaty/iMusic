@@ -274,6 +274,7 @@ final class PlayerService: ObservableObject {
     @Published private(set) var servedQuality: String?
     /// Resolved request tier when a source does not report actual audio metadata.
     @Published private(set) var requestedQuality: String?
+    @Published private(set) var offlineQualityLabel: String?
     @Published private(set) var unblockSource: String?
     @Published private(set) var isTrial = false
     let clock = PlaybackClock()
@@ -1511,6 +1512,7 @@ final class PlayerService: ObservableObject {
         duration = track.duration
         servedQuality = nil
         requestedQuality = nil
+        offlineQualityLabel = nil
         unblockSource = nil
         isTrial = false
         lyrics = nil
@@ -1586,6 +1588,7 @@ final class PlayerService: ObservableObject {
         let downloads = DownloadManager.shared
         if let local = downloads.record(for: track) {
             resolvedURL = downloads.fileURL(for: local)
+            offlineQualityLabel = local.qualityLabel
             servedByLXQuality = local.qualityVerified == true ? local.quality : nil
             resolvedRequestQuality = local.quality
         } else {

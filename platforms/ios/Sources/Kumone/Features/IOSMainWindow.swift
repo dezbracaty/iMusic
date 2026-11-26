@@ -84,6 +84,7 @@ public struct IOSMainWindow: View {
                 RenderingBudget.shared.setSceneActive(phase == .active)
                 player.setSceneActive(phase == .active)
                 guard phase == .active else { return }
+                DownloadManager.shared.reload()
                 guard !IOSUITestMode.isEnabled else { return }
                 Task { @MainActor in
                     await account.refreshForOpen()
