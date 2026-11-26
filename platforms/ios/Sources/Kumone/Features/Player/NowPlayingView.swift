@@ -1549,6 +1549,9 @@ struct NowPlayingView: View {
                 .accessibilityLabel(liked ? "取消收藏" : "收藏")
 
                 Menu {
+                    #if os(iOS)
+                    TrackDownloadMenu(track: track)
+                    #endif
                     Button {
                         player.addToPlayNext(track)
                     } label: {
@@ -2407,6 +2410,9 @@ private struct CompactTrackHeader: View {
                     .accessibilityIdentifier("immersiveFavoriteButton")
 
                     Menu {
+                        #if os(iOS)
+                        TrackDownloadMenu(track: track)
+                        #endif
                         Button {
                             player.addToPlayNext(track)
                         } label: {

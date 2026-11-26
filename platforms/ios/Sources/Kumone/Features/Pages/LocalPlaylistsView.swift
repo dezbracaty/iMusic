@@ -27,6 +27,12 @@ struct LocalPlaylistsView: View {
                 }
                 .accessibilityIdentifier("libraryLikedSongs")
                 .accessibilityLabel("我喜欢的音乐，\(likedSongsSubtitle)")
+                #if os(iOS)
+                NavigationLink(value: Destination.downloads) {
+                    libraryRowLabel("已下载", icon: "arrow.down.circle", detail: nil)
+                }
+                .accessibilityIdentifier("libraryDownloads")
+                #endif
                 libraryNavigationRow("最近播放", icon: "clock", destination: .recents)
                 libraryNavigationRow("我的收藏", icon: "square.stack", destination: .collections)
                 NavigationLink {

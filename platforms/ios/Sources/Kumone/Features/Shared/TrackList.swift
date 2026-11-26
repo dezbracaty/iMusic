@@ -121,6 +121,10 @@ struct TrackRow: View {
                     .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 4))
             }
 
+            #if os(iOS)
+            TrackDownloadIndicator(track: track)
+            #endif
+
             if let trailingText {
                 Text(trailingText)
                     .font(.caption2.monospacedDigit())
@@ -323,6 +327,9 @@ struct TrackRow: View {
         Button("收藏到歌单…") {
             showAddToPlaylist = true
         }
+        #if os(iOS)
+        TrackDownloadMenu(track: track)
+        #endif
         if onRemoved != nil {
             Button("从本地歌单中删除", role: .destructive) {
                 onRemoved?()

@@ -116,7 +116,8 @@ final class LXUserAPIService: ObservableObject {
     }
 
     func resolveDownloadMusicURL(for track: Track, quality: String) async throws -> ResolvedURL {
-        try await Self.downloadResolver.resolveMusicURL(for: track, quality: quality)
+        let resolver = self === Self.shared ? Self.downloadResolver : self
+        return try await resolver.resolveMusicURL(for: track, quality: quality, forDownload: true)
     }
 
     /// Load a provider only when a request actually needs one.  A user's
@@ -185,15 +186,20 @@ final class LXUserAPIService: ObservableObject {
     }
 
     func resolveMusicURL(for track: Track, quality: String) async throws -> ResolvedURL {
+        try await resolveMusicURL(for: track, quality: quality, forDownload: false)
+    }
+
+    private func resolveMusicURL(for track: Track, quality: String, forDownload: Bool) async throws -> ResolvedURL {
         try await acquireSourceOperation()
         defer { releaseSourceOperation() }
         try Task.checkCancellation()
-        return try await resolveMusicURLAcrossSources(for: track, quality: quality)
+        return try await resolveMusicURLAcrossSources(for: track, quality: quality, forDownload: forDownload)
     }
 
-    private func resolveMusicURLAcrossSources(for track: Track, quality: String) async throws -> ResolvedURL {
+    private func resolveMusicURLAcrossSources(for track: Track, quality: String,
+                                              forDownload: Bool) async throws -> ResolvedURL {
         let primaryPlatform = self.primaryPlatform(for: track)
-        let fallbackEnabled = platformFallbackEnabled()
+        let fallbackEnabled = !forDownload && platformFallbackEnabled()
         guard primaryPlatform != nil || fallbackEnabled else { throw LXCatalogError.unsupported }
         let snapshot = sourceSnapshot()
         let sourceRevision = snapshot.revision

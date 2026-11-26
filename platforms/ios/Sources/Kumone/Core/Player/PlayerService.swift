@@ -1582,10 +1582,10 @@ final class PlayerService: ObservableObject {
 #endif
 
 #if os(iOS)
-        // Cached downloads and enabled LX sources are the only iOS audio routes.
-        if let local = DownloadManager.shared.record(for: track),
-           FileManager.default.fileExists(atPath: local.fileURL.path) {
-            resolvedURL = local.fileURL
+        // Use the saved file before consulting the enabled sources.
+        let downloads = DownloadManager.shared
+        if let local = downloads.record(for: track) {
+            resolvedURL = downloads.fileURL(for: local)
             servedByLXQuality = local.qualityVerified == true ? local.quality : nil
             resolvedRequestQuality = local.quality
         } else {
@@ -1697,7 +1697,11 @@ final class PlayerService: ObservableObject {
         // has to be spliced in here or not at all. Sources that refuse byte-range
         // requests never resolve a track — those play untapped and the UI falls
         // back to its decorative animation.
+        #if os(iOS)
+        let asset = url.isFileURL ? DownloadManager.localAsset(at: url) : AVURLAsset(url: url)
+        #else
         let asset = AVURLAsset(url: url)
+        #endif
         let assetTrack = await loadAudioTrack(from: asset, timeout: 2)
         guard generation == resolveGeneration else { return }
 

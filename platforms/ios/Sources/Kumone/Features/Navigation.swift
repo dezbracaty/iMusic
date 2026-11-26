@@ -75,6 +75,9 @@ enum Destination: Hashable {
     case search(String)
     case localPlaylists
     case localPlaylist(UUID)
+    #if os(iOS)
+    case downloads
+    #endif
     case likedSongs
 }
 
@@ -146,6 +149,10 @@ struct DestinationsModifier: ViewModifier {
                     LocalPlaylistsView()
                 case .localPlaylist(let id):
                     LocalPlaylistDetailView(playlistID: id)
+                #if os(iOS)
+                case .downloads:
+                    DownloadsView()
+                #endif
                 case .likedSongs:
                     LikedSongsView()
                 }
