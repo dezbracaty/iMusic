@@ -6,9 +6,11 @@ enum ReleaseChecker {
     struct AppIdentity: Equatable {
         let shortVersion: String
         let buildNumber: String
+        var displayLabel: String? = nil
 
         var displayVersion: String {
-            buildNumber.isEmpty ? shortVersion : "\(shortVersion) (\(buildNumber))"
+            let label = displayLabel ?? shortVersion
+            return buildNumber.isEmpty ? label : "\(label) (\(buildNumber))"
         }
 
         var isValid: Bool {
@@ -33,9 +35,11 @@ enum ReleaseChecker {
 
     static var currentIdentity: AppIdentity {
         let info = Bundle.main.infoDictionary ?? [:]
+        let label = (info["IMusicDisplayVersion"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         return AppIdentity(
             shortVersion: (info["CFBundleShortVersionString"] as? String ?? "0").trimmingCharacters(in: .whitespacesAndNewlines),
-            buildNumber: (info["CFBundleVersion"] as? String ?? "0").trimmingCharacters(in: .whitespacesAndNewlines)
+            buildNumber: (info["CFBundleVersion"] as? String ?? "0").trimmingCharacters(in: .whitespacesAndNewlines),
+            displayLabel: label.flatMap { $0.isEmpty || $0.contains("$(") ? nil : $0 }
         )
     }
 

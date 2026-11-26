@@ -96,25 +96,40 @@ jobs:
         id: version
         shell: bash
         run: |
+          set -euo pipefail
+          config=platforms/ios/ios/Config/Shared.xcconfig
+          setting() {
+            sed -n "s/^$1[[:space:]]*=[[:space:]]*//p" "$config" | head -n 1 | tr -d '[:space:]'
+          }
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            version="${GITHUB_REF_NAME#v}"
+            display_version="${GITHUB_REF_NAME#v}"
+            version="${display_version%%-*}"
+            if [[ "$version" =~ ^[0-9]+\.[0-9]+$ ]]; then version="$version.0"; fi
+            build_number="$GITHUB_RUN_NUMBER"
           else
-            version="$(sed -n 's/^MARKETING_VERSION[[:space:]]*=[[:space:]]*//p' platforms/ios/ios/Config/Shared.xcconfig | head -n 1 | tr -d '[:space:]')"
+            version="$(setting MARKETING_VERSION)"
+            display_version="$(setting IMUSIC_DISPLAY_VERSION)"
+            configured_build="$(setting CURRENT_PROJECT_VERSION)"
+            [[ "$configured_build" =~ ^[1-9][0-9]*$ ]]
+            build_number=$((configured_build + GITHUB_RUN_NUMBER - 1))
           fi
 
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid marketing version: $version" >&2
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ||
+                ! "$display_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid iOS bundle or display version" >&2
             exit 1
           fi
 
           echo "marketing_version=$version" >> "$GITHUB_OUTPUT"
-          echo "build_number=$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "Building iMusic $version ($GITHUB_RUN_NUMBER)"
+          echo "display_version=$display_version" >> "$GITHUB_OUTPUT"
+          echo "build_number=$build_number" >> "$GITHUB_OUTPUT"
+          echo "Building iMusic $display_version ($build_number)"
 
       - name: Build unsigned iOS app
         working-directory: platforms/ios/ios
         env:
           MARKETING_VERSION: ${{ steps.version.outputs.marketing_version }}
+          IMUSIC_DISPLAY_VERSION: ${{ steps.version.outputs.display_version }}
           CURRENT_PROJECT_VERSION: ${{ steps.version.outputs.build_number }}
         run: |
           xcodebuild \
@@ -125,6 +140,7 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             MARKETING_VERSION="$MARKETING_VERSION" \
+            IMUSIC_DISPLAY_VERSION="$IMUSIC_DISPLAY_VERSION" \
             CURRENT_PROJECT_VERSION="$CURRENT_PROJECT_VERSION" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -135,13 +151,17 @@ jobs:
         working-directory: platforms/ios/ios
         env:
           EXPECTED_VERSION: ${{ steps.version.outputs.marketing_version }}
+          EXPECTED_DISPLAY_VERSION: ${{ steps.version.outputs.display_version }}
+          EXPECTED_BUILD: ${{ steps.version.outputs.build_number }}
         run: |
           app="build/Build/Products/Release-iphoneos/iMusic.app"
           actual="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")"
           build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist")"
-          echo "Bundle version: $actual ($build)"
-          if [[ "$actual" != "$EXPECTED_VERSION" ]]; then
-            echo "Bundle version mismatch: expected $EXPECTED_VERSION, got $actual" >&2
+          display="$(/usr/libexec/PlistBuddy -c 'Print :IMusicDisplayVersion' "$app/Info.plist")"
+          echo "Bundle version: $actual ($build), app display version: $display"
+          if [[ "$actual" != "$EXPECTED_VERSION" || "$build" != "$EXPECTED_BUILD" ||
+                "$display" != "$EXPECTED_DISPLAY_VERSION" ]]; then
+            echo "Bundle or app display version mismatch" >&2
             exit 1
           fi
           bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"
@@ -158,7 +178,7 @@ jobs:
       - name: Package unsigned IPA
         working-directory: platforms/ios/ios
         env:
-          RELEASE_VERSION: ${{ steps.version.outputs.marketing_version }}
+          RELEASE_VERSION: ${{ steps.version.outputs.display_version }}
         run: |
           mkdir -p dist/Payload
           cp -R build/Build/Products/Release-iphoneos/iMusic.app dist/Payload/iMusic.app
@@ -171,7 +191,8 @@ jobs:
       - name: Inspect IPA contents
         working-directory: platforms/ios/ios
         env:
-          RELEASE_VERSION: ${{ steps.version.outputs.marketing_version }}
+          RELEASE_VERSION: ${{ steps.version.outputs.display_version }}
+          EXPECTED_VERSION: ${{ steps.version.outputs.marketing_version }}
         run: |
           set -euo pipefail
           unzip -l "dist/imusic_ios_${RELEASE_VERSION}.ipa" | grep -F 'Payload/iMusic.app/' >/dev/null
@@ -183,18 +204,18 @@ jobs:
           # structural validation, not a claim of provisioning/installability.
           python3 ../../../scripts/verify_ios_ipa.py \
             "dist/imusic_ios_${RELEASE_VERSION}.ipa" \
-            --expected-version "$RELEASE_VERSION" \
+            --expected-version "$EXPECTED_VERSION" \
             --expected-bundle-id com.jiajia2222.imusic.ios
 
       - name: Upload IPA
         uses: actions/upload-artifact@v6
         with:
           name: iMusic-ios-unsigned
-          path: platforms/ios/ios/dist/imusic_ios_${{ steps.version.outputs.marketing_version }}.ipa
+          path: platforms/ios/ios/dist/imusic_ios_${{ steps.version.outputs.display_version }}.ipa
           if-no-files-found: error
 
       - name: Attach IPA to GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: platforms/ios/ios/dist/imusic_ios_${{ steps.version.outputs.marketing_version }}.ipa
+          files: platforms/ios/ios/dist/imusic_ios_${{ steps.version.outputs.display_version }}.ipa
